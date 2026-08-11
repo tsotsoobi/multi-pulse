@@ -227,6 +227,56 @@ export interface VenueLimits {
  * tens of percent, not the order of magnitude a shared ladder produced. Adjust
  * the rungs, in a commit, when the ratio has moved enough to care about.
  *
+ * ---------------------------------------------------------------------------
+ * MEASURED 2026-08-11: THE RATIO IS 6.27:1, NOT 10:1.
+ *
+ * Not a guess this time. Both figures are read off the deepest stablecoin pool
+ * on each venue, which is the only numeraire available without a price feed --
+ * a stablecoin pool's own reserve ratio IS the chain's opinion of what its
+ * native asset is worth, and it costs one request per venue to ask.
+ *
+ *   XLM  Horizon /liquidity_pools, native <-> USDC:GA5ZSEJY...KZVN
+ *        13,256,961.2409614 XLM / 2,129,305.2453931 USDC  =>  $0.16062
+ *
+ *   XRP  rippled amm_info, XRP <-> RLUSD (rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De)
+ *        1,977,192 XRP / 1,991,246 RLUSD                  =>  $1.00711
+ *
+ *   ratio 1.00711 / 0.16062 = 6.27 XLM per XRP
+ *
+ * NOTE THE DIRECTION. The paragraph above anticipated the ratio widening --
+ * "if the real ratio has moved to 15:1, the XRPL ladder is probing deeper". It
+ * moved the other way, so it is STELLAR that now probes deeper, by about 1.6x:
+ *
+ *   top rung        Stellar $160.62   XRPL $100.71
+ *   minNetProfit    Stellar $0.0016   XRPL $0.0010
+ *   minPoolNative   Stellar $1,606    XRPL $1,007
+ *
+ * Every dollar figure written elsewhere in this file is also about 1.9x too
+ * high in absolute terms: the depth floor is ~$1,606, not the "~$3,000" its own
+ * comment claims, and the fee assumptions are ~$0.00016 rather than ~$0.0003.
+ * The RELATIVE symmetry between the venues survives; only the labels are stale.
+ *
+ * Left unretuned deliberately. A collection run was in progress when this was
+ * measured, and changing the ladders mid-run makes the rows before and after
+ * incomparable in exactly the way this whole block exists to prevent -- with
+ * nothing in the CSV marking where the change happened. Retune between runs.
+ *
+ * THE REAL FIX IS TO STOP HARDCODING IT. Both venues already fetch the pool
+ * that answers this question: StellarVenue walks every Horizon pool including
+ * XLM/USDC, and XrplVenue probes every seeded pair including XRP/RLUSD. So the
+ * rate could be derived at startup from data already in hand -- read once,
+ * printed in the banner, and stamped into the CSV so every row states the rate
+ * it was sized against -- with no price feed, no third party, and no extra
+ * request. That would make the ladders self-calibrating and this comment
+ * unnecessary.
+ *
+ * It was not done now for the same reason the rungs were not retuned: it
+ * changes what is measured, mid-run. It also needs a decision this file cannot
+ * make on its own -- a derived rate moves between runs, so two CSVs would no
+ * longer share a ladder unless the rate is pinned per run and recorded. That is
+ * the right design; it is not a comment-sized change.
+ * ---------------------------------------------------------------------------
+ *
  * The rungs are the same eleven relative steps on both venues, so a rung index
  * means the same thing on each side and the two ladders can be compared
  * position by position.
