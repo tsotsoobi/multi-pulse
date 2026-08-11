@@ -290,11 +290,27 @@ async function walkShard(bound: ShardBound): Promise<ShardResult> {
  */
 async function getJson(url: string): Promise<any> {
   for (let attempt = 1; ; attempt++) {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(HORIZON_TIMEOUT_MS),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(HORIZON_TIMEOUT_MS),
+      });
+    } catch (e: any) {
+      // A TRANSPORT failure -- a timeout, a dropped connection, a DNS blip --
+      // rather than an answer from Horizon. It has to be retried for the same
+      // reason a 429 does, and leaving it out was half a fix: the walk issues
+      // ~206 requests, so one stalled request threw away all 206, the tick was
+      // logged as an error, and StreakTracker correctly treated the whole
+      // interval as unobserved. Measured persistence was therefore capped by
+      // local network weather rather than by the market. Seen in the wild at
+      // ~19% of Stellar ticks in an hour, all "aborted due to timeout" or
+      // "fetch failed", with no 429 among them.
+      if (attempt > HORIZON_RETRIES) throw e;
+      await sleep(Math.min(HORIZON_BACKOFF_BASE_MS * attempt, HORIZON_MAX_BACKOFF_MS));
+      continue;
+    }
 
     if (res.ok) return res.json();
 
