@@ -22,6 +22,7 @@ const COLUMNS = [
   "net_profit",
   "first_seen",
   "last_seen",
+  "tick_interval_ms",
 ] as const;
 
 /**
@@ -49,6 +50,27 @@ interface Row {
   net_profit: string;
   first_seen: string;
   last_seen: string;
+  /**
+   * Milliseconds between this venue's previous tick and this one.
+   *
+   * THE RESOLUTION first_seen/last_seen WERE MEASURED AT. A streak is counted
+   * in ticks, and "three consecutive ticks" is a duration only once you know
+   * how long a tick is -- so the file now carries it rather than leaving a
+   * reader to assume POLL_MS, which is a floor the venues leave far behind.
+   *
+   * The obvious worry is that this differs per venue, making cross-venue
+   * persistence incomparable. Measured, it does not: monitor.ts polls every
+   * venue once per iteration of a single loop, so all venues share one interval
+   * -- ~12s after the Stellar walk was parallelised, ~70s before it. The value
+   * is logged per row anyway, because that lockstep is a property of a loop
+   * somebody could restructure, and a column that measures the claim outlives a
+   * comment that asserts it.
+   *
+   * Compare `seconds` between first_seen and last_seen for a duration; use this
+   * to know how coarsely that duration was sampled. 0 is a venue's first tick,
+   * which has no preceding tick to measure from.
+   */
+  tick_interval_ms: string;
 }
 
 /** RFC 4180: quote when the value contains a comma, quote or newline. */
@@ -90,6 +112,7 @@ function appendRow(row: Row, atIso: string, path: string = LOG_PATH): void {
       row.net_profit,
       row.first_seen,
       row.last_seen,
+      row.tick_interval_ms,
     ]
       .map(csvField)
       .join(",");
@@ -204,6 +227,7 @@ export function logOpportunity(
   op: Opportunity,
   streak: Streak,
   at: Date,
+  tickIntervalMs: number,
   path?: string,
 ): void {
   appendRow(
@@ -219,6 +243,7 @@ export function logOpportunity(
       net_profit: op.netProfit.toFixed(7),
       first_seen: streak.firstSeen,
       last_seen: streak.lastSeen,
+      tick_interval_ms: String(tickIntervalMs),
     },
     at.toISOString(),
     path,
@@ -238,6 +263,7 @@ export function logHeartbeat(
   status: string,
   at: Date,
   kind: "heartbeat" | "error" = "heartbeat",
+  tickIntervalMs = 0,
   path?: string,
 ): void {
   appendRow(
@@ -253,6 +279,7 @@ export function logHeartbeat(
       net_profit: "",
       first_seen: "",
       last_seen: "",
+      tick_interval_ms: String(tickIntervalMs),
     },
     at.toISOString(),
     path,

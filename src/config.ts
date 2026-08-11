@@ -41,20 +41,53 @@ export const POLL_MS = 2000;
 export const HORIZON_PAGE_LIMIT = 200;
 
 /**
- * Hard stop on pages walked per fetchPools() call.
+ * Hard stop on pages walked PER SHARD, per fetchPools() call.
  *
  * Horizon's paging cursor always yields a `next` link, including on the empty
  * page past the end, so the loop's real terminator is the zero-record page.
  * This cap exists only so a Horizon bug or a cursor that fails to advance
  * cannot spin forever inside one tick. At 200 records a page it admits 60k
- * pools, comfortably above the live mainnet count -- if this cap is ever hit,
- * the pool set is truncated and the tick is reported as incomplete rather than
- * quietly under-counted.
+ * pools per shard, comfortably above the live mainnet count for the whole
+ * network -- if this cap is ever hit, the pool set is truncated and the tick is
+ * reported as incomplete rather than quietly under-counted.
+ *
+ * Per shard rather than per call since the walk was split: a shard covers about
+ * 1/HORIZON_SHARDS of the id space, so mainnet's ~201 pages is ~17 per shard
+ * and this is roughly 18x the headroom it was before.
  */
 export const HORIZON_MAX_PAGES = 300;
 
 /** Per-request timeout for Horizon GETs, in milliseconds. */
 export const HORIZON_TIMEOUT_MS = 15_000;
+
+/**
+ * How many id-ranges the pool walk is split into and fetched concurrently.
+ *
+ * WHY THIS EXISTS. Measured on mainnet: a serial walk is 201 pages at ~300ms
+ * each, and 99.93% of the 61-second tick was waiting on HTTP -- 60,687ms of
+ * network against 43ms of parsing and searching combined. Horizon caps a page
+ * at 200 records and its paging is cursor-based, so page N+1's URL only arrives
+ * inside page N's response: the walk cannot be made faster by asking for more
+ * per request, and it cannot be pipelined along a single cursor chain.
+ *
+ * It CAN be split. A liquidity pool's paging_token is its id, which is a
+ * fixed-width 64-char lowercase hex hash, so Horizon's `order=asc` is plain
+ * lexicographic order over a uniformly distributed space. That means the id
+ * range can be cut into N contiguous slices up front, with no prior knowledge
+ * of what is in them, and each slice walked on its own cursor chain in
+ * parallel. Hashes spread evenly, so the slices come out about the same size.
+ *
+ * This is NOT sampling and it is NOT a cache. Every slice still walks to its
+ * own exhaustion and the slices tile the whole id space, so the result is the
+ * same complete pool set the serial walk produced -- Venue.fetchPools requires
+ * exhaustion and this preserves it exactly.
+ *
+ * 12 is chosen over something larger because the gain is sub-linear (the walk
+ * is bounded by the slowest slice, not the average) while the cost to a shared
+ * public Horizon is linear in concurrency. See HORIZON_MAX_PAGES for what the
+ * per-slice page cap now means.
+ */
+export const HORIZON_SHARDS = 12;
 
 /**
  * Minimum NET edge, in basis points of trade size, for a route to be logged.

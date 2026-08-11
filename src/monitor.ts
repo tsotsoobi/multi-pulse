@@ -76,6 +76,9 @@ const trackers = new Map<string, StreakTracker>(
   VENUES.map(({ venue }) => [venue.name, new StreakTracker()]),
 );
 
+/** Start time of each venue's previous tick, for the streak-resolution figure. */
+const lastTickStart = new Map<string, number>();
+
 let running = true;
 
 async function tick(): Promise<void> {
@@ -88,6 +91,46 @@ async function tick(): Promise<void> {
     tracker.beginTick();
 
     const startedAt = Date.now();
+
+    // THE RESOLUTION THIS VENUE'S STREAKS ARE MEASURED AT.
+    //
+    // Not the tick's DURATION -- the gap between one tick of this venue and the
+    // next, which is what a streak of N ticks actually spans. The two are
+    // different numbers and confusing them invites a specific wrong conclusion,
+    // so both are reported: tick_ms is work, interval_ms is resolution.
+    //
+    // THE WRONG CONCLUSION, AND WHY THE ARCHITECTURE ALREADY PREVENTS IT. It is
+    // natural to read "stellar tick_ms=61177, xrpl tick_ms=1850" as the two
+    // venues sampling at wildly different rates, which would make a streak of
+    // three ticks mean three minutes on one venue and six seconds on the other
+    // -- opposite findings about how long an edge survives. That is not what
+    // happens. tick() walks ENABLED_VENUES sequentially inside a single loop, so
+    // every venue gets exactly one tick per iteration and they advance in
+    // lockstep. A venue's interval is the WHOLE loop, never its own work.
+    //
+    // Measured, both before and after the Stellar walk was parallelised:
+    //
+    //   serial walk    stellar tick_ms ~61000, xrpl tick_ms ~1900
+    //                  interval_ms ~63000-76000 for BOTH
+    //   sharded walk   stellar tick_ms ~7100, xrpl tick_ms ~2000-4900
+    //                  interval_ms ~11900 stellar, ~11300-11900 xrpl
+    //
+    // The intervals agree to within the offset between the two venues' start
+    // times, which is all they can differ by. So streak lengths ARE directly
+    // comparable across venues, and were even at 61 seconds a tick -- the slow
+    // walk degraded BOTH venues equally rather than either one relative to the
+    // other. What the parallel walk bought is resolution for both: ~12s instead
+    // of ~70s, so an edge lasting half a minute is now visible at all.
+    //
+    // This is measured per tick rather than asserted, because it is a property
+    // of a loop somebody could restructure -- give each venue its own timer and
+    // the claim silently becomes false while every comment still reads true.
+    //
+    // 0 on a venue's first tick, where there is no previous tick to measure to.
+    const previousStart = lastTickStart.get(venue.name);
+    const intervalMs = previousStart === undefined ? 0 : startedAt - previousStart;
+    lastTickStart.set(venue.name, startedAt);
+
     try {
       const pools = await venue.fetchPools();
 
@@ -97,15 +140,15 @@ async function tick(): Promise<void> {
 
       const ops = findOpportunities(venue, pools, limits);
       const at = new Date();
+      const elapsed = Date.now() - startedAt;
 
       const streaks = new Map<string, Streak>();
       for (const op of ops) {
         const streak = tracker.mark(op.routeKey, at);
         streaks.set(op.routeKey, streak);
-        logOpportunity(op, streak, at);
+        logOpportunity(op, streak, at, intervalMs);
       }
 
-      const elapsed = Date.now() - startedAt;
       // `pools` is what the venue saw; `searched` is what the graph was built
       // from. Reporting these, always -- including zeros -- is the point: a
       // reader comparing venues has to be able to see how much of one venue's
@@ -115,15 +158,18 @@ async function tick(): Promise<void> {
       // are not depth-checked at all -- see the gap note on partitionByDepth --
       // so this number is "abandoned native pools removed", not "everything
       // thin removed", and must not be read as the latter.
+      const records = recordCount(venue);
       const status =
+        (records !== null ? `records=${records} ` : "") +
         `pools=${pools.length} searched=${deep.length}` +
         ` shallow=${shallow.length} routes=${ops.length}` +
-        ` streaks=${tracker.activeCount} tick_ms=${elapsed}` +
+        ` streaks=${tracker.activeCount}` +
+        ` tick_ms=${elapsed} interval_ms=${intervalMs}` +
         fetchNote(venue);
 
       // Written whatever happened, including ops.length === 0. Without this
       // row a quiet market and a dead process produce the same empty file.
-      logHeartbeat(venue.name, status, at);
+      logHeartbeat(venue.name, status, at, "heartbeat", intervalMs);
       printTick(venue, ops, streaks, status);
     } catch (e: any) {
       const at = new Date();
@@ -133,6 +179,7 @@ async function tick(): Promise<void> {
         `error: ${message} tick_ms=${Date.now() - startedAt}`,
         at,
         "error",
+        intervalMs,
       );
       console.error(`[${stamp(at)}] ${venue.name} tick failed: ${message}`);
     } finally {
@@ -152,7 +199,13 @@ async function tick(): Promise<void> {
  * other 10%.
  */
 interface PagedVenue {
-  lastFetch: { pages: number; skipped: number; truncated: boolean };
+  lastFetch: {
+    pages: number;
+    records: number;
+    skipped: number;
+    truncated: boolean;
+    shards: number;
+  };
 }
 
 /**
@@ -176,12 +229,30 @@ function hasOwnNote(v: Venue): v is Venue & SelfReportingVenue {
 function fetchNote(venue: Venue): string {
   if (hasOwnNote(venue)) return venue.fetchNote();
   if (!hasFetchStats(venue)) return "";
-  const { pages, skipped, truncated } = venue.lastFetch;
+  const { pages, skipped, truncated, shards } = venue.lastFetch;
   return (
-    ` pages=${pages}` +
-    (skipped > 0 ? ` skipped=${skipped}` : "") +
+    ` pages=${pages} shards=${shards}` +
+    // Always printed, including zero. `records` minus `skipped` is `pools`, and
+    // that subtraction is only checkable if both ends are present -- a skipped
+    // count that appears only when nonzero makes its own absence ambiguous.
+    ` skipped=${skipped}` +
     (truncated ? " TRUNCATED" : "")
   );
+}
+
+/**
+ * Records Horizon returned, before normalisation dropped any, or null for a
+ * venue that does not page.
+ *
+ * Reported next to `pools` so the gap between them is legible rather than
+ * implied. They differ by exactly `skipped`, and on mainnet that is ~420
+ * emptied pools every tick -- real ledger entries whose liquidity has all been
+ * withdrawn, which persist until reaped and cannot be quoted. Before this,
+ * `pools=39395` read as "what Horizon has" when it meant "what survived", and
+ * nothing in the row said 420 records had gone.
+ */
+function recordCount(venue: Venue): number | null {
+  return hasFetchStats(venue) ? venue.lastFetch.records : null;
 }
 
 /**

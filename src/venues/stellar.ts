@@ -1,6 +1,7 @@
 import {
   HORIZON_MAX_PAGES,
   HORIZON_PAGE_LIMIT,
+  HORIZON_SHARDS,
   HORIZON_TIMEOUT_MS,
   HORIZON_URL,
   STELLAR_BASE_FEE_STROOPS,
@@ -37,9 +38,15 @@ interface HorizonPoolRecord {
 /** What one page of pools told us, kept so the caller can report truncation. */
 export interface FetchStats {
   pages: number;
+  /** Records Horizon returned, BEFORE normalisation dropped any. */
   records: number;
+  /** Records that could not be turned into a Pool. records - skipped = pools. */
   skipped: number;
   truncated: boolean;
+  /** Id-range slices walked concurrently. */
+  shards: number;
+  /** Wall-clock of the walk itself, in ms. */
+  walkMs: number;
 }
 
 export class StellarVenue implements Venue {
@@ -53,6 +60,8 @@ export class StellarVenue implements Venue {
     records: 0,
     skipped: 0,
     truncated: false,
+    shards: 0,
+    walkMs: 0,
   };
 
   /**
@@ -69,47 +78,41 @@ export class StellarVenue implements Venue {
    * opportunities rather than making the numbers slightly worse.
    */
   async fetchPools(): Promise<Pool[]> {
-    const pools: Pool[] = [];
+    const startedAt = Date.now();
+    const bounds = shardBounds(HORIZON_SHARDS);
+
+    // Every shard walks its own cursor chain to its own exhaustion, and the
+    // shards tile the whole id space, so this is still an exhaustive walk --
+    // just not a serial one. See HORIZON_SHARDS.
+    const walked = await Promise.all(bounds.map((b) => walkShard(b)));
+
+    // Keyed by pool id rather than concatenated. The shard boundaries are
+    // half-open and should not overlap, but a duplicate would be indeterminate
+    // rather than harmless: arb.ts treats two pool ids as two independent
+    // venues, so the same pool twice reads as a pair of pools quoting identical
+    // prices -- a zero-edge cycle that still costs thousands of simulate()
+    // calls. Deduping here makes the boundary arithmetic non-load-bearing.
+    const byId = new Map<string, Pool>();
     const stats: FetchStats = {
       pages: 0,
       records: 0,
       skipped: 0,
       truncated: false,
+      shards: bounds.length,
+      walkMs: 0,
     };
 
-    let url =
-      `${HORIZON_URL}/liquidity_pools` +
-      `?limit=${HORIZON_PAGE_LIMIT}&order=asc`;
-
-    while (url) {
-      if (stats.pages >= HORIZON_MAX_PAGES) {
-        stats.truncated = true;
-        break;
-      }
-
-      const page = await getJson(url);
-      stats.pages++;
-
-      const records = Array.isArray(page?._embedded?.records)
-        ? (page._embedded.records as HorizonPoolRecord[])
-        : [];
-
-      // The terminator. An empty page means the cursor has run off the end.
-      if (records.length === 0) break;
-
-      stats.records += records.length;
-      for (const r of records) {
-        const pool = toPool(r);
-        if (pool) pools.push(pool);
-        else stats.skipped++;
-      }
-
-      const next = page?._links?.next?.href;
-      url = typeof next === "string" ? next : "";
+    for (const w of walked) {
+      stats.pages += w.pages;
+      stats.records += w.records;
+      stats.skipped += w.skipped;
+      stats.truncated ||= w.truncated;
+      for (const pool of w.pools) byId.set(pool.id, pool);
     }
 
+    stats.walkMs = Date.now() - startedAt;
     this.lastFetch = stats;
-    return pools;
+    return [...byId.values()];
   }
 
   /**
@@ -151,6 +154,127 @@ export class StellarVenue implements Venue {
     if (issuer.length <= 12) return `${code}(${issuer})`;
     return `${code}(${issuer.slice(0, 4)}..${issuer.slice(-4)})`;
   }
+}
+
+/** Half-open id range for one shard: (after, upTo]. */
+interface ShardBound {
+  /** Exclusive lower bound, as a cursor. Empty means "from the beginning". */
+  after: string;
+  /** Inclusive upper bound. Null on the last shard, which has no ceiling. */
+  upTo: string | null;
+}
+
+/** Pool ids are 64 lowercase hex characters, always. */
+const ID_HEX_LEN = 64;
+
+/**
+ * Cut the pool-id space into `count` contiguous ranges.
+ *
+ * The cut points are the first four hex characters scaled across 0x0000..0xffff
+ * and zero-padded to full width. That works because a pool id is a hash: the
+ * ids are spread evenly across the space, so equal slices of the SPACE are
+ * roughly equal slices of the POOL SET, without anyone having to know what the
+ * ids are beforehand. Four characters is 65,536 cut points, far finer than any
+ * shard count worth using.
+ *
+ * The ranges are half-open, (after, upTo], and they tile the space with no gap
+ * and no overlap:
+ *
+ *   - shard 0 has an empty `after`, so it starts before the lowest id rather
+ *     than after some cut point.
+ *   - shard k > 0 starts with cursor = the cut point, and Horizon's cursor is
+ *     EXCLUSIVE, so it begins strictly after it.
+ *   - shard k-1 stops once it sees an id strictly GREATER than that same cut
+ *     point, so an id landing exactly on a boundary is kept by k-1 rather than
+ *     falling into the gap between the two.
+ *   - the last shard has no ceiling and walks to the end of the space.
+ */
+export function shardBounds(count: number): ShardBound[] {
+  const n = Math.max(1, Math.floor(count));
+  const cut = (i: number): string =>
+    Math.floor((i * 0x1_0000) / n)
+      .toString(16)
+      .padStart(4, "0")
+      .padEnd(ID_HEX_LEN, "0");
+
+  const out: ShardBound[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push({
+      after: i === 0 ? "" : cut(i),
+      upTo: i === n - 1 ? null : cut(i + 1),
+    });
+  }
+  return out;
+}
+
+interface ShardResult {
+  pools: Pool[];
+  pages: number;
+  records: number;
+  skipped: number;
+  truncated: boolean;
+}
+
+/**
+ * Walk one id range to exhaustion.
+ *
+ * Termination is unchanged from the serial walk -- the zero-record page, never
+ * a missing `next` link and never a short page -- with one addition: a shard
+ * also stops when it walks past its own ceiling, because the records beyond it
+ * belong to the next shard and are being fetched there concurrently.
+ */
+async function walkShard(bound: ShardBound): Promise<ShardResult> {
+  const out: ShardResult = {
+    pools: [],
+    pages: 0,
+    records: 0,
+    skipped: 0,
+    truncated: false,
+  };
+
+  let url =
+    `${HORIZON_URL}/liquidity_pools` +
+    `?limit=${HORIZON_PAGE_LIMIT}&order=asc` +
+    (bound.after ? `&cursor=${bound.after}` : "");
+
+  while (url) {
+    if (out.pages >= HORIZON_MAX_PAGES) {
+      out.truncated = true;
+      break;
+    }
+
+    const page = await getJson(url);
+    out.pages++;
+
+    const records = Array.isArray(page?._embedded?.records)
+      ? (page._embedded.records as HorizonPoolRecord[])
+      : [];
+
+    // The terminator. An empty page means the cursor has run off the end.
+    if (records.length === 0) break;
+
+    let crossed = false;
+    for (const r of records) {
+      // Compared as plain strings, which is exact here and not a shortcut: ids
+      // are fixed-width lowercase hex, so lexicographic order and Horizon's
+      // `order=asc` are the same order. A variable-width or numeric token would
+      // need real parsing, and this would silently mis-slice.
+      if (bound.upTo !== null && typeof r.id === "string" && r.id > bound.upTo) {
+        crossed = true;
+        break;
+      }
+      out.records++;
+      const pool = toPool(r);
+      if (pool) out.pools.push(pool);
+      else out.skipped++;
+    }
+    if (crossed) break;
+
+    const next = page?._links?.next?.href;
+    url = typeof next === "string" ? next : "";
+  }
+
+  return out;
 }
 
 /**

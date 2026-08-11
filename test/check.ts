@@ -12,7 +12,7 @@ import {
   venueLimits,
 } from "../src/config.js";
 import { StreakTracker, logHeartbeat, logOpportunity, LOG_PATH } from "../src/logger.js";
-import { StellarVenue } from "../src/venues/stellar.js";
+import { StellarVenue, shardBounds } from "../src/venues/stellar.js";
 import {
   XrplVenue,
   buildCandidates,
@@ -97,14 +97,20 @@ check("dropped route is forgotten", t.activeCount === 1);
 // appends and simply rebuilt the header on its next tick.
 const TEST_CSV = resolve(tmpdir(), "multi-pulse-check-opportunities.csv");
 rmSync(TEST_CSV, { force: true });
-logOpportunity(top, s1, t0, TEST_CSV);
-logHeartbeat("stellar", "pools=2 routes=1", t0, "heartbeat", TEST_CSV);
-logHeartbeat("stellar", "error: Horizon 503", t0, "error", TEST_CSV);
+logOpportunity(top, s1, t0, 61177, TEST_CSV);
+logHeartbeat("stellar", "pools=2 routes=1", t0, "heartbeat", 61177, TEST_CSV);
+logHeartbeat("stellar", "error: Horizon 503", t0, "error", 61177, TEST_CSV);
 const csv = readFileSync(TEST_CSV, "utf8").trim().split("\n");
 check("header matches spec",
-  csv[0] === "timestamp,venue,kind,route_key,route_label,size,output,gross_bps,fee_native,net_profit,first_seen,last_seen",
+  csv[0] === "timestamp,venue,kind,route_key,route_label,size,output,gross_bps,fee_native,net_profit,first_seen,last_seen,tick_interval_ms",
   csv[0]);
-check("opportunity row has 12 fields", (csv[1]!.match(/,/g) ?? []).length === 11, csv[1]);
+check("opportunity row has 13 fields", (csv[1]!.match(/,/g) ?? []).length === 12, csv[1]);
+// The resolution a streak was measured at must ride on every row, including
+// heartbeats -- a reader comparing venues needs it wherever persistence is.
+check("tick interval is carried on the opportunity row",
+  csv[1]!.endsWith(",61177"), csv[1]);
+check("tick interval is carried on heartbeats too",
+  csv[2]!.endsWith(",61177") && csv[3]!.endsWith(",61177"), csv[2]);
 check("heartbeat row present", csv[2]!.includes(",heartbeat,,"), csv[2]);
 check("error row present", csv[3]!.includes(",error,,"), csv[3]);
 rmSync(TEST_CSV, { force: true });
@@ -259,6 +265,70 @@ check("the heartbeat shouts about dropped seeds",
   dropped.fetchNote().includes("SEEDS_DROPPED=1"), dropped.fetchNote());
 check("a clean seed list says nothing about drops",
   !new XrplVenue([{ currency: "USD", issuer: RIPPLE_USD_ISSUER }]).fetchNote().includes("SEEDS_DROPPED"));
+
+// ---------------------------------------------------------------------------
+// 8b. SHARDED POOL WALK.
+//
+// The Stellar walk was split into concurrent id ranges because 99.93% of a
+// 61-second tick was serial HTTP wait. The whole correctness question is
+// whether the ranges TILE the id space: a gap silently loses pools, which does
+// not degrade the answer but removes whole cycles, and an overlap would feed
+// arb.ts the same pool twice as if it were two venues quoting identically.
+//
+// These checks are on the arithmetic alone -- no network -- because that is
+// where a tiling bug would live.
+// ---------------------------------------------------------------------------
+
+const idOf = (hex: string) => hex.padEnd(64, "0");
+
+for (const n of [1, 2, 3, 12, 16, 37]) {
+  const bounds = shardBounds(n);
+  const ok =
+    bounds.length === n &&
+    bounds[0]!.after === "" &&                       // starts before the lowest id
+    bounds[n - 1]!.upTo === null &&                  // last shard has no ceiling
+    bounds.every((b, i) => i === 0 || b.after === bounds[i - 1]!.upTo);
+  check(`shardBounds(${n}) tiles the id space with no gap`, ok,
+    JSON.stringify(bounds.map((b) => [b.after.slice(0, 4), b.upTo?.slice(0, 4) ?? "END"])));
+}
+
+// Every id must fall in exactly one shard, boundary values included. A shard
+// covers (after, upTo], so an id landing exactly on a cut point belongs to the
+// LOWER shard -- Horizon's cursor is exclusive, so the upper shard skips it.
+const bounds12 = shardBounds(12);
+const owns = (id: string): number =>
+  bounds12.findIndex(
+    (b) => (b.after === "" || id > b.after) && (b.upTo === null || id <= b.upTo),
+  );
+const probeIds = [
+  idOf("0000"), idOf("0001"), idOf("1555"), idOf("2aaa"), idOf("5555"),
+  idOf("aaaa"), idOf("ffff"), "f".repeat(64),
+  ...bounds12.slice(1).map((b) => b.upTo ?? ""),   // exact cut points
+  ...bounds12.slice(1).map((b) => b.after),
+].filter(Boolean);
+check("every id belongs to exactly one shard",
+  probeIds.every((id) => {
+    const hits = bounds12.filter(
+      (b) => (b.after === "" || id > b.after) && (b.upTo === null || id <= b.upTo),
+    );
+    return hits.length === 1;
+  }),
+  probeIds.map((id) => `${id.slice(0, 4)}->${owns(id)}`).join(" "));
+
+// The lowest and highest possible ids must be covered.
+check("the id space is covered end to end",
+  owns("0".repeat(64)) === 0 && owns("f".repeat(64)) === bounds12.length - 1,
+  `lo=${owns("0".repeat(64))} hi=${owns("f".repeat(64))}`);
+
+// A single shard degenerates to the original serial walk: no cursor, no ceiling.
+const one = shardBounds(1);
+check("one shard is the whole space, unbounded",
+  one.length === 1 && one[0]!.after === "" && one[0]!.upTo === null);
+
+// String comparison is exact only because ids are fixed-width lowercase hex.
+check("shard bounds are full-width 64-char hex",
+  shardBounds(12).every((b) => b.after === "" || b.after.length === 64) &&
+    shardBounds(12).every((b) => b.upTo === null || b.upTo.length === 64));
 
 // ---------------------------------------------------------------------------
 // 9. PER-VENUE SIZING.
