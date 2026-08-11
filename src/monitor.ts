@@ -308,7 +308,29 @@ async function main(): Promise<void> {
   // startup must read it once, or two rows of the same CSV end up priced
   // against different fees with nothing in the file saying so.
   for (const { venue, limits } of VENUES) {
-    if (hasLifecycle(venue)) await venue.start();
+    // A venue that cannot open must not take the process down with it.
+    //
+    // It did: an XRPL cluster IP limit threw out of start(), main().catch
+    // called process.exit(1), and a completely healthy Stellar venue stopped
+    // collecting because a different chain's public endpoint was busy. The poll
+    // loop already treats a venue's failure as that venue's problem -- it logs
+    // an error row and carries on -- and startup had no reason to be stricter.
+    //
+    // The venue is kept rather than dropped, because the failures that happen
+    // here are transient by nature (a rate limit, a closed socket) and both
+    // venues re-establish what they need per tick anyway. What is lost is only
+    // what start() would have read: for XRPL that is the live reference fee, so
+    // it prices against the config fallback and every heartbeat says
+    // FEE_FALLBACK until a restart. Degraded and saying so, rather than absent.
+    if (hasLifecycle(venue)) {
+      try {
+        await venue.start();
+      } catch (e: any) {
+        console.error(
+          `${venue.name}: start failed, continuing degraded: ${e?.message ?? e}`,
+        );
+      }
+    }
     // The ladder is printed because it is denominated: "size=250" in the CSV
     // means 250 XLM on one venue and 250 XRP on another, and the two ladders
     // are only comparable under an exchange rate assumption stated in

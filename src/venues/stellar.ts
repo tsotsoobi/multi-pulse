@@ -1,6 +1,9 @@
 import {
+  HORIZON_BACKOFF_BASE_MS,
+  HORIZON_MAX_BACKOFF_MS,
   HORIZON_MAX_PAGES,
   HORIZON_PAGE_LIMIT,
+  HORIZON_RETRIES,
   HORIZON_SHARDS,
   HORIZON_TIMEOUT_MS,
   HORIZON_URL,
@@ -286,17 +289,41 @@ async function walkShard(bound: ShardBound): Promise<ShardResult> {
  * transport in this repo.
  */
 async function getJson(url: string): Promise<any> {
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(HORIZON_TIMEOUT_MS),
-  });
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(HORIZON_TIMEOUT_MS),
+    });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Horizon ${res.status} for ${url}: ${body.slice(0, 200)}`);
+    if (res.ok) return res.json();
+
+    // 429 and 5xx are "ask again later", not "this request was wrong". They
+    // must not fail the tick: monitor.ts logs a failed tick as an error row and
+    // StreakTracker treats it as an unobserved interval, which BREAKS EVERY
+    // STREAK. A transient rate limit would therefore not just cost one sample,
+    // it would silently cap measured persistence at one tick -- destroying the
+    // one measurement this repo exists to produce, while the CSV still looked
+    // healthy. Retrying here keeps the tick whole.
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable || attempt > HORIZON_RETRIES) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Horizon ${res.status} for ${url}: ${body.slice(0, 200)}`);
+    }
+
+    // Horizon states how long to wait when it rate-limits. Honour it rather
+    // than guessing; guessing low is what caused the limit in the first place.
+    const header = Number(res.headers.get("retry-after"));
+    const waitMs = Number.isFinite(header) && header > 0
+      ? Math.min(header * 1000, HORIZON_MAX_BACKOFF_MS)
+      : Math.min(HORIZON_BACKOFF_BASE_MS * attempt, HORIZON_MAX_BACKOFF_MS);
+    await res.text().catch(() => {});
+    await sleep(waitMs);
   }
-  return res.json();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**

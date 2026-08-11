@@ -31,8 +31,53 @@ export const ENABLED_VENUES: readonly VenueName[] = ["stellar", "xrpl"];
 /** Horizon base URL. Read-only REST; only GET requests are ever issued. */
 export const HORIZON_URL = "https://horizon.stellar.org";
 
-/** How often to poll every venue, in milliseconds. */
-export const POLL_MS = 2000;
+/**
+ * Minimum length of one loop iteration, in milliseconds. Every venue is polled
+ * once per iteration, so this is the floor on every venue's sampling interval.
+ *
+ * WHY THIS IS NOT 2000 ANY MORE, AND WHY THE OLD VALUE WAS NEVER TESTED. It was
+ * 2000 when a Stellar tick took 61 seconds, so it never bound anything: the
+ * loop ran as fast as Horizon allowed and the interval was ~70s whatever this
+ * said. Parallelising the walk cut the tick to ~7s, POLL_MS became the actual
+ * governor for the first time, and the request rate went up about ninefold --
+ * not because the walk got bigger, but because it repeated nine times as often.
+ *
+ * Measured consequence: ~206 requests per walk at an ~8s interval is ~26 req/s,
+ * or ~92,700 requests an hour against a shared public Horizon, which answered
+ * with sustained 429s -- 60-70% of Stellar ticks failing. The serial walk's
+ * ~2.9 req/s (~10,300/hour) had drawn no 429 at all, so the tolerated rate is
+ * somewhere between the two and nearer the lower.
+ *
+ * 60000 puts the walk back to roughly the rate that was demonstrably accepted
+ * while KEEPING the part of the parallel walk that actually mattered: a
+ * snapshot assembled in ~7s instead of ~61s. Resolution returns to about what
+ * it was; internal consistency of each snapshot is 8x better and stays that
+ * way. Those two are independent, and it was the second one that was a
+ * correctness problem rather than a comfort.
+ *
+ * RAISING RESOLUTION FROM HERE COSTS REQUESTS, and there is no way around that
+ * while the venue must enumerate 39,000 pools to see any of them. Halving this
+ * doubles the request rate. If a faster Stellar sample is ever needed, the
+ * honest routes are a Horizon instance that is not shared, or per-venue
+ * cadences so XRPL can stay fast while Stellar does not have to.
+ */
+export const POLL_MS = 60_000;
+
+/**
+ * Retries for a Horizon request that failed in a way worth asking again about.
+ *
+ * A retryable failure that is NOT retried does not cost one sample, it breaks
+ * every streak: monitor.ts records a failed tick as an error row and
+ * StreakTracker treats an unobserved interval as evidence of nothing, which is
+ * correct and is exactly why a transient 429 must never reach it.
+ */
+export const HORIZON_RETRIES = 4;
+
+/** Backoff between Horizon retries when no Retry-After header is offered. */
+export const HORIZON_BACKOFF_BASE_MS = 2000;
+
+/** Ceiling on one backoff wait, including a Retry-After Horizon asks for. */
+export const HORIZON_MAX_BACKOFF_MS = 20_000;
 
 /**
  * Records per Horizon page. 200 is Horizon's maximum; a smaller value only
@@ -311,13 +356,24 @@ export const SUMMARY_TOP_N = 3;
  * ledger reads, and test/check.ts fails the build if any other command literal
  * appears under src/ or scripts/.
  *
- * Alternatives, both verified to answer correctly: wss://s1.ripple.com,
- * wss://s2.ripple.com. They matter more than they look: a public cluster will
- * IP rate-limit a heavy caller off itself, and `npm run seeds` is heavy enough
- * to trigger that. The scripts take an endpoint argument for exactly this; the
- * monitor does not, because a run should be attributable to one stated node.
+ * WHICH NODE, AND WHY IT IS THIS ONE. A public cluster will IP rate-limit a
+ * heavy caller off itself, and `npm run seeds` is heavy enough to trigger that:
+ * a full AMM walk is several thousand ledger_data pages. Both xrplcluster.com
+ * and xrpl.ws answered "Connection (public) IP limit reached" for hours
+ * afterwards, which took the whole XRPL venue offline while Stellar collected
+ * normally -- half a comparison is not a comparison.
+ *
+ * s2.ripple.com answered correctly throughout, so it is the default. This is a
+ * checked-in constant rather than an argument the monitor accepts, so every run
+ * is attributable to one stated node by reading the commit it ran from. The
+ * offline SCRIPTS do take an endpoint argument, because being unable to reach
+ * one node says nothing about the seed list they are checking.
+ *
+ * Alternatives, all verified to answer at some point: wss://s1.ripple.com,
+ * wss://xrplcluster.com, wss://xrpl.ws. Prefer a node that is not shared if the
+ * poll interval is ever tightened; see POLL_MS on what request rate cost here.
  */
-export const XRPL_WS_URL = "wss://xrplcluster.com";
+export const XRPL_WS_URL = "wss://s2.ripple.com";
 
 /**
  * Fallback reference fee for one XRPL transaction, in DROPS. 1e6 drops = 1 XRP,
