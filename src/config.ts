@@ -189,11 +189,19 @@ export interface VenueLimits {
  * largest trade probed through it before it is allowed into the graph at all.
  * That bounds how much of any reported edge is slippage against a puddle.
  *
- * WHAT IT CANNOT DO. The floor is measured on the pool's NATIVE side, so it
- * cannot be applied to token-to-token pools, which have no native side and no
- * depth measure comparable across assets without a price feed this repo does
- * not have. Those pools stay in the graph. A triangular cycle therefore still
- * has one leg that is not depth-checked, though both of its outer legs are.
+ * WHAT IT DOES NOT DO, AND WHY NOT. The floor applies ONLY to pools with a
+ * native side, which means every triangle's middle leg is unchecked. That gap
+ * is real and there is evidence for it -- see the gap note on partitionByDepth
+ * in arb.ts, which records the SCOP cluster capping at 5 XLM and the measured
+ * cost of trying to close it with a per-pool filter (Stellar's searchable graph
+ * fell from 29,485 pools to 153, and both venues went to routes=0).
+ *
+ * The short version: this threshold is justified by capital PASSING THROUGH a
+ * pool, which is the right question for an outer leg, where the trade enters
+ * and leaves in native terms. A middle leg carries only what the first hop
+ * produced, so an absolute native floor is the wrong instrument there. The
+ * correct fix is a per-route, per-rung slippage check inside bestSize(), not a
+ * per-pool filter, and it is not implemented.
  * ---------------------------------------------------------------------------
  */
 export const VENUE_LIMITS: Record<VenueName, VenueLimits> = {

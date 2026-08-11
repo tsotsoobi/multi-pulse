@@ -115,8 +115,54 @@ export function nativeReserve(venue: Venue, pool: Pool): number | null {
  * enough" would drift, and the drift would show up as a heartbeat that
  * confidently reports a number describing a filter nobody applied.
  *
- * A pool with no native side is KEPT: it cannot be measured, and dropping
- * everything unmeasurable would silently delete every triangular route.
+ * A pool with no native side is KEPT. See the gap note below: this is a known
+ * limitation, deliberately left open, not an oversight.
+ *
+ * ---------------------------------------------------------------------------
+ * KNOWN GAP: MIDDLE-LEG DEPTH IS NOT MEASURED.
+ *
+ * A triangular cycle is native -> X -> Y -> native. Both outer legs are native
+ * pools and are checked here. The middle leg, X -> Y, is token-to-token, has no
+ * native side, and is NOT depth-checked by anything in this repo.
+ *
+ * THE EVIDENCE THAT IT MATTERS. Live output showed a cluster of routes through
+ * SCOP -- XLM > SCOP > XAU > XLM and two siblings -- clearing at sizes of 5 and
+ * 10 XLM on an eleven-rung ladder that reaches 1000. Every outer leg in those
+ * cycles held at least 10,000 XLM by construction, so deep native pools cannot
+ * be what capped the trade that low. The unchecked middle leg is the most
+ * likely binding constraint. (Not proven: the reserves of those three pools
+ * were never read, and a genuinely small edge losing to slippage would look the
+ * same.)
+ *
+ * WHY A PER-POOL NATIVE FLOOR IS THE WRONG INSTRUMENT, AND WAS REVERTED. It was
+ * tried: token-to-token pools were valued in native via an implied rate from
+ * the deepest native pool for each asset, and judged against minPoolNative.
+ * Measured effect on Stellar mainnet: the searchable graph fell from 29,485
+ * pools to 153, and both venues went to routes=0. That is not a refinement, it
+ * is a filter that guarantees the measurement is vacuous.
+ *
+ * The reasoning behind minPoolNative does not transfer. That threshold is "10x
+ * the top ladder rung", and its justification is about CAPITAL PASSING THROUGH
+ * a pool -- which is exactly right for an outer leg, where the trade enters and
+ * exits denominated in native. A middle leg does not carry 10,000 XLM. It
+ * carries whatever the first hop produced, which at a 5 XLM trade is 5 XLM
+ * worth of X. Requiring the middle pool to hold 10,000 XLM of value to move 5
+ * XLM through it is the wrong question by three orders of magnitude, and it
+ * rejects the entire interior of the graph to prevent a much smaller error.
+ *
+ * THE CORRECT FIX, IF THIS EVER MATTERS. Check depth PER ROUTE, not per pool:
+ * at each rung, compare the amount actually arriving from the previous hop
+ * against the reserve it is about to be swapped into, and reject the rung when
+ * that ratio implies more slippage than the edge can survive. That is a
+ * property of (route, size), not of a pool, so it cannot be expressed as a
+ * filter on the pool set at all -- it belongs inside bestSize(), where both
+ * numbers are already in hand. It would also subsume this whole function.
+ *
+ * Until then: a reported triangular route's middle leg is unvetted, and its
+ * chosen `size` is the honest signal of how much the route could actually
+ * carry. A triangle clearing only at the bottom of the ladder is evidence of a
+ * thin leg somewhere, not of a rich opportunity.
+ * ---------------------------------------------------------------------------
  */
 export function partitionByDepth(
   venue: Venue,

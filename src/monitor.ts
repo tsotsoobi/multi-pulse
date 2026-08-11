@@ -93,7 +93,7 @@ async function tick(): Promise<void> {
 
       // Counted with the same predicate findOpportunities filters on, so this
       // number always describes the filter that actually ran.
-      const { shallow } = partitionByDepth(venue, pools, limits.minPoolNative);
+      const { deep, shallow } = partitionByDepth(venue, pools, limits.minPoolNative);
 
       const ops = findOpportunities(venue, pools, limits);
       const at = new Date();
@@ -107,11 +107,16 @@ async function tick(): Promise<void> {
 
       const elapsed = Date.now() - startedAt;
       // `pools` is what the venue saw; `searched` is what the graph was built
-      // from. Reporting both, always -- including shallow=0 -- is the point: a
+      // from. Reporting these, always -- including zeros -- is the point: a
       // reader comparing venues has to be able to see how much of one venue's
       // quiet is the depth floor rather than the market.
+      //
+      // `shallow` counts only pools with a native side. Token-to-token pools
+      // are not depth-checked at all -- see the gap note on partitionByDepth --
+      // so this number is "abandoned native pools removed", not "everything
+      // thin removed", and must not be read as the latter.
       const status =
-        `pools=${pools.length} searched=${pools.length - shallow.length}` +
+        `pools=${pools.length} searched=${deep.length}` +
         ` shallow=${shallow.length} routes=${ops.length}` +
         ` streaks=${tracker.activeCount} tick_ms=${elapsed}` +
         fetchNote(venue);

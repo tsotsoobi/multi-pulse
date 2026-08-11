@@ -57,13 +57,25 @@ function csvField(value: string): string {
 }
 
 /**
- * Append one row, creating data/ and the header as needed. Failures are
+ * Append one row, creating the directory and header as needed. Failures are
  * swallowed with a warning: logging must never take down the poll loop.
+ *
+ * `path` exists so the TEST SUITE can exercise the CSV format without writing
+ * to the file a live monitor is appending to. It is not a config knob and
+ * nothing in src/ passes it.
+ *
+ * This is not hypothetical tidiness. test/check.ts used to assert the CSV shape
+ * against LOG_PATH itself, rm-ing it before and after -- so running `npm run
+ * check` while a monitor was polling DELETED that run's accumulated rows, and
+ * the monitor, which only ever appends, silently rebuilt the file with a fresh
+ * header on its next tick. Hours of collection could vanish with no error
+ * anywhere, and the resulting file looked perfectly healthy.
  */
-function appendRow(row: Row, atIso: string): void {
+function appendRow(row: Row, atIso: string, path: string = LOG_PATH): void {
   try {
-    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    const isNew = !existsSync(LOG_PATH);
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const isNew = !existsSync(path);
 
     const line = [
       atIso,
@@ -83,7 +95,7 @@ function appendRow(row: Row, atIso: string): void {
       .join(",");
 
     appendFileSync(
-      LOG_PATH,
+      path,
       (isNew ? COLUMNS.join(",") + "\n" : "") + line + "\n",
       "utf8",
     );
@@ -188,7 +200,12 @@ export class StreakTracker {
   }
 }
 
-export function logOpportunity(op: Opportunity, streak: Streak, at: Date): void {
+export function logOpportunity(
+  op: Opportunity,
+  streak: Streak,
+  at: Date,
+  path?: string,
+): void {
   appendRow(
     {
       venue: op.venue,
@@ -204,6 +221,7 @@ export function logOpportunity(op: Opportunity, streak: Streak, at: Date): void 
       last_seen: streak.lastSeen,
     },
     at.toISOString(),
+    path,
   );
 }
 
@@ -220,6 +238,7 @@ export function logHeartbeat(
   status: string,
   at: Date,
   kind: "heartbeat" | "error" = "heartbeat",
+  path?: string,
 ): void {
   appendRow(
     {
@@ -236,5 +255,6 @@ export function logHeartbeat(
       last_seen: "",
     },
     at.toISOString(),
+    path,
   );
 }

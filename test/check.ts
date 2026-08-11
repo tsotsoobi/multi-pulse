@@ -23,6 +23,7 @@ import {
 } from "../src/venues/xrpl.js";
 import type { Pool, Venue } from "../src/venue.js";
 import { readFileSync, readdirSync, rmSync, type Dirent } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -89,18 +90,34 @@ check("gap resets first_seen", s3.firstSeen === t4.toISOString() && s3.seconds =
 check("dropped route is forgotten", t.activeCount === 1);
 
 // 7. CSV shape.
-rmSync(LOG_PATH, { force: true });
-logOpportunity(top, s1, t0);
-logHeartbeat("stellar", "pools=2 routes=1", t0);
-logHeartbeat("stellar", "error: Horizon 503", t0, "error");
-const csv = readFileSync(LOG_PATH, "utf8").trim().split("\n");
+//
+// Written to a SCRATCH path, never LOG_PATH. This test rm's the file it writes,
+// and when it used the real one, running `npm run check` against a live monitor
+// deleted that run's accumulated rows -- silently, because the monitor only
+// appends and simply rebuilt the header on its next tick.
+const TEST_CSV = resolve(tmpdir(), "multi-pulse-check-opportunities.csv");
+rmSync(TEST_CSV, { force: true });
+logOpportunity(top, s1, t0, TEST_CSV);
+logHeartbeat("stellar", "pools=2 routes=1", t0, "heartbeat", TEST_CSV);
+logHeartbeat("stellar", "error: Horizon 503", t0, "error", TEST_CSV);
+const csv = readFileSync(TEST_CSV, "utf8").trim().split("\n");
 check("header matches spec",
   csv[0] === "timestamp,venue,kind,route_key,route_label,size,output,gross_bps,fee_native,net_profit,first_seen,last_seen",
   csv[0]);
 check("opportunity row has 12 fields", (csv[1]!.match(/,/g) ?? []).length === 11, csv[1]);
 check("heartbeat row present", csv[2]!.includes(",heartbeat,,"), csv[2]);
 check("error row present", csv[3]!.includes(",error,,"), csv[3]);
-rmSync(LOG_PATH, { force: true });
+rmSync(TEST_CSV, { force: true });
+
+// Guard the guard: prove this test cannot reach the production CSV again.
+//
+// The needle is assembled rather than written out, because this check reads its
+// OWN source -- spelled literally it would match itself and fail forever.
+const FORBIDDEN = "rmSync(" + "LOG_PATH";
+check("the CSV test never touches the live log path",
+  TEST_CSV !== LOG_PATH &&
+    !readFileSync(fileURLToPath(import.meta.url), "utf8").includes(FORBIDDEN),
+  TEST_CSV);
 
 // ---------------------------------------------------------------------------
 // 8. XRPL adapter
@@ -366,29 +383,67 @@ const deepPools = [p("D1", REAL, 1_000_000, 100_000), p("D2", REAL, 1_000_000, 9
 check("deep pools are unaffected by the floor",
   findOpportunities(v, deepPools).length > 0);
 
-// Shallow pools leave the GRAPH, not just the results: a dust pool must not be
-// usable as the middle leg of a triangle either.
+// Shallow NATIVE pools leave the GRAPH, not just the results.
 const partitioned = partitionByDepth(v, [...dustPools, ...deepPools], S.minPoolNative);
 check("partition puts dust in shallow and depth in deep",
   partitioned.shallow.length === 2 && partitioned.deep.length === 2,
   `deep=${partitioned.deep.length} shallow=${partitioned.shallow.length}`);
 
-// A token-to-token pool has no native side and cannot be measured. It must be
-// KEPT, not dropped -- dropping the unmeasurable would delete every triangle.
-const tokenToToken: Pool = { id: "t2t", a: REAL, b: DUSTY, ra: 1, rb: 1, feeBp: 30 };
-check("a pool with no native side is kept, not dropped",
-  partitionByDepth(v, [tokenToToken], S.minPoolNative).deep.length === 1);
-check("nativeReserve reports null for a token-to-token pool",
-  nativeReserve(v, tokenToToken) === null);
 check("nativeReserve finds the native side whichever way round it is",
   nativeReserve(v, p("n1", REAL, 42, 1)) === 42 &&
     nativeReserve(v, { id: "n2", a: REAL, b: "native", ra: 1, rb: 42, feeBp: 30 }) === 42);
 
+// --- The middle-leg gap, pinned as DELIBERATE ------------------------------
+//
+// A token-to-token pool has no native side and is kept however thin it is.
+// This is a known unmeasured gap, not an oversight, and these checks exist so
+// that the gap stays a decision somebody made rather than a surprise.
+//
+// Closing it with a per-pool native floor was tried and reverted: on Stellar
+// mainnet it cut the searchable graph from 29,485 pools to 153 and drove both
+// venues to routes=0. minPoolNative is justified by capital passing THROUGH a
+// pool, which is the right question for an outer leg carrying the whole trade
+// in native terms, and the wrong one for a middle leg carrying only what the
+// first hop produced. The correct fix is a per-route, per-rung slippage check
+// inside bestSize(); see the gap note on partitionByDepth.
+const OTHER = "OTHR:GOTHERxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+const t2t = (id: string, ra: number, rb: number): Pool =>
+  ({ id, a: REAL, b: OTHER, ra, rb, feeBp: 30 });
+
+const thinMiddle = partitionByDepth(v, [t2t("thin", 1, 1)], S.minPoolNative);
+check("a token-to-token pool is KEPT however thin -- the known gap",
+  thinMiddle.deep.length === 1 && thinMiddle.shallow.length === 0,
+  `deep=${thinMiddle.deep.length}`);
+check("nativeReserve reports null for a token-to-token pool",
+  nativeReserve(v, t2t("t", 1, 1)) === null);
+
+// The gap has a visible consequence, and `size` is what makes it visible: a
+// triangle over a thin middle leg is still reported, but only at the bottom of
+// the ladder. That is the signal a reader is meant to use.
+const outerDeep = [
+  p("o1", REAL, 1_000_000, 100_000),
+  p("o2", OTHER, 1_000_000, 90_000),
+];
+const thinTri = findOpportunities(v, [...outerDeep, t2t("thinmid", 50, 50)])
+  .filter((o) => o.kind === "triangular");
+const fatTri = findOpportunities(v, [...outerDeep, t2t("fatmid", 500_000, 500_000)])
+  .filter((o) => o.kind === "triangular");
+check("a thin middle leg caps the route near the bottom of the ladder",
+  thinTri.length > 0 && thinTri[0]!.size <= 25,
+  `size=${thinTri[0]?.size}`);
+check("a deep middle leg lets the same route reach far higher",
+  fatTri.length > 0 && fatTri[0]!.size > thinTri[0]!.size,
+  `thin=${thinTri[0]?.size} fat=${fatTri[0]?.size}`);
+
 // The heartbeat's count and the search's filter must come from one predicate.
 const mixed2 = [...dustPools, ...deepPools];
-check("what the heartbeat calls shallow is exactly what the search drops",
-  partitionByDepth(v, mixed2, S.minPoolNative).deep.length ===
-    mixed2.length - partitionByDepth(v, mixed2, S.minPoolNative).shallow.length);
+const split2 = partitionByDepth(v, mixed2, S.minPoolNative);
+check("every pool lands in exactly one bucket",
+  split2.deep.length + split2.shallow.length === mixed2.length,
+  `${split2.deep.length}+${split2.shallow.length} of ${mixed2.length}`);
+check("what the search drops is exactly what the heartbeat counts as dropped",
+  findOpportunities(v, mixed2).every((o) =>
+    o.poolIds.every((id) => split2.deep.some((q) => q.id === id))));
 
 // A caller may narrow the ceiling but never widen it past the venue's own.
 const widened = findOpportunities(x, [
