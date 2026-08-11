@@ -1,5 +1,16 @@
-import { findOpportunities, type Opportunity } from "./arb.js";
-import { POLL_MS, SUMMARY_TOP_N } from "./config.js";
+import {
+  findOpportunities,
+  limitsFor,
+  partitionByDepth,
+  type SearchLimits,
+  type Opportunity,
+} from "./arb.js";
+import {
+  ENABLED_VENUES,
+  POLL_MS,
+  SUMMARY_TOP_N,
+  type VenueName,
+} from "./config.js";
 import {
   LOG_PATH,
   StreakTracker,
@@ -8,6 +19,7 @@ import {
   type Streak,
 } from "./logger.js";
 import { StellarVenue } from "./venues/stellar.js";
+import { XrplVenue } from "./venues/xrpl.js";
 import type { Venue } from "./venue.js";
 
 /**
@@ -19,17 +31,55 @@ import type { Venue } from "./venue.js";
  * the only thing this can express.
  */
 
-const VENUES: Venue[] = [new StellarVenue()];
+/**
+ * Built from ENABLED_VENUES, so which chains are watched is a property of the
+ * committed config rather than of this file. The switch is exhaustive on
+ * VenueName: adding a venue to the union without building it here is a compile
+ * error, not a venue that silently never runs.
+ */
+function buildVenue(name: VenueName): Venue {
+  switch (name) {
+    case "stellar":
+      return new StellarVenue();
+    case "xrpl":
+      return new XrplVenue();
+  }
+}
+
+/**
+ * A venue and the limits its search runs under, paired at startup.
+ *
+ * The pairing is explicit rather than left to findOpportunities' default
+ * because the limits are denominated in the venue's own asset: a ladder rung is
+ * 1000 XLM on one venue and 100 XRP on the other, and those are the same size
+ * only in the sense that matters here -- dollars. Binding them here means the
+ * banner can print what each venue was actually searched with, so a reader of
+ * data/opportunities.csv can see the sizing that produced it.
+ */
+interface Watched {
+  venue: Venue;
+  limits: SearchLimits;
+}
+
+const VENUES: Watched[] = ENABLED_VENUES.map((name) => ({
+  venue: buildVenue(name),
+  limits: limitsFor(name),
+}));
+
+if (VENUES.length === 0) {
+  console.error("config: ENABLED_VENUES is empty, nothing to observe");
+  process.exit(1);
+}
 
 /** One tracker per venue: route keys are only unique within a venue. */
 const trackers = new Map<string, StreakTracker>(
-  VENUES.map((v) => [v.name, new StreakTracker()]),
+  VENUES.map(({ venue }) => [venue.name, new StreakTracker()]),
 );
 
 let running = true;
 
 async function tick(): Promise<void> {
-  for (const venue of VENUES) {
+  for (const { venue, limits } of VENUES) {
     const tracker = trackers.get(venue.name)!;
 
     // Advanced before the fetch, so a tick that fails still counts as a tick
@@ -40,7 +90,12 @@ async function tick(): Promise<void> {
     const startedAt = Date.now();
     try {
       const pools = await venue.fetchPools();
-      const ops = findOpportunities(venue, pools);
+
+      // Counted with the same predicate findOpportunities filters on, so this
+      // number always describes the filter that actually ran.
+      const { shallow } = partitionByDepth(venue, pools, limits.minPoolNative);
+
+      const ops = findOpportunities(venue, pools, limits);
       const at = new Date();
 
       const streaks = new Map<string, Streak>();
@@ -51,8 +106,13 @@ async function tick(): Promise<void> {
       }
 
       const elapsed = Date.now() - startedAt;
+      // `pools` is what the venue saw; `searched` is what the graph was built
+      // from. Reporting both, always -- including shallow=0 -- is the point: a
+      // reader comparing venues has to be able to see how much of one venue's
+      // quiet is the depth floor rather than the market.
       const status =
-        `pools=${pools.length} routes=${ops.length}` +
+        `pools=${pools.length} searched=${pools.length - shallow.length}` +
+        ` shallow=${shallow.length} routes=${ops.length}` +
         ` streaks=${tracker.activeCount} tick_ms=${elapsed}` +
         fetchNote(venue);
 
@@ -90,11 +150,26 @@ interface PagedVenue {
   lastFetch: { pages: number; skipped: number; truncated: boolean };
 }
 
+/**
+ * A venue whose coverage story is its own. Stellar's is "how many Horizon pages
+ * did we walk"; XRPL's is "how many candidate pairs did we probe and how many
+ * had an AMM". Those do not reduce to a common shape, so a venue that has
+ * something specific to say says it itself.
+ */
+interface SelfReportingVenue {
+  fetchNote(): string;
+}
+
 function hasFetchStats(v: Venue): v is Venue & PagedVenue {
   return typeof (v as Partial<PagedVenue>).lastFetch?.pages === "number";
 }
 
+function hasOwnNote(v: Venue): v is Venue & SelfReportingVenue {
+  return typeof (v as Partial<SelfReportingVenue>).fetchNote === "function";
+}
+
 function fetchNote(venue: Venue): string {
+  if (hasOwnNote(venue)) return venue.fetchNote();
   if (!hasFetchStats(venue)) return "";
   const { pages, skipped, truncated } = venue.lastFetch;
   return (
@@ -102,6 +177,24 @@ function fetchNote(venue: Venue): string {
     (skipped > 0 ? ` skipped=${skipped}` : "") +
     (truncated ? " TRUNCATED" : "")
   );
+}
+
+/**
+ * A venue that has to open something before it can read, and close it after.
+ *
+ * Optional for the same reason PagedVenue is: Horizon is stateless HTTP and has
+ * nothing to open. XRPL holds a WebSocket, and reads its reference fee once
+ * before the loop starts rather than per tick, so that every row in a run was
+ * priced against the same stated number.
+ */
+interface LifecycleVenue {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+function hasLifecycle(v: Venue): v is Venue & LifecycleVenue {
+  const c = v as Partial<LifecycleVenue>;
+  return typeof c.start === "function" && typeof c.stop === "function";
 }
 
 function printTick(
@@ -129,18 +222,45 @@ function stamp(d: Date): string {
 }
 
 async function main(): Promise<void> {
-  console.log(`multi-pulse: observing ${VENUES.map((v) => v.name).join(", ")}`);
+  console.log(
+    `multi-pulse: observing ${VENUES.map(({ venue }) => venue.name).join(", ")}`,
+  );
   console.log(`poll=${POLL_MS}ms  log=${LOG_PATH}`);
   console.log("read-only: this process cannot sign or submit anything\n");
 
-  // Scheduled after each tick completes rather than on a fixed interval: a
-  // slow Horizon page would otherwise stack overlapping ticks, and two ticks
-  // in flight at once would corrupt the streak counters they share.
-  while (running) {
-    const started = Date.now();
-    await tick();
-    const wait = Math.max(0, POLL_MS - (Date.now() - started));
-    if (running && wait > 0) await sleep(wait);
+  // Before the loop, not inside it. A venue that reads a network constant at
+  // startup must read it once, or two rows of the same CSV end up priced
+  // against different fees with nothing in the file saying so.
+  for (const { venue, limits } of VENUES) {
+    if (hasLifecycle(venue)) await venue.start();
+    // The ladder is printed because it is denominated: "size=250" in the CSV
+    // means 250 XLM on one venue and 250 XRP on another, and the two ladders
+    // are only comparable under an exchange rate assumption stated in
+    // config.ts. Printing the range each venue was searched over puts that
+    // assumption in the run's own output rather than only in a source comment.
+    console.log(
+      `${venue.name}: ready  fee=${venue.feeNative}` +
+        ` sizes=${limits.sizeLadder[0]}..${limits.maxSize}` +
+        ` min_net=${limits.minNetProfit} min_bps=${limits.minProfitBps}` +
+        ` min_pool=${limits.minPoolNative}` +
+        fetchNote(venue),
+    );
+  }
+
+  try {
+    // Scheduled after each tick completes rather than on a fixed interval: a
+    // slow Horizon page would otherwise stack overlapping ticks, and two ticks
+    // in flight at once would corrupt the streak counters they share.
+    while (running) {
+      const started = Date.now();
+      await tick();
+      const wait = Math.max(0, POLL_MS - (Date.now() - started));
+      if (running && wait > 0) await sleep(wait);
+    }
+  } finally {
+    for (const { venue } of VENUES) {
+      if (hasLifecycle(venue)) await venue.stop().catch(() => {});
+    }
   }
 }
 

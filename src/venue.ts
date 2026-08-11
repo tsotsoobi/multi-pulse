@@ -68,15 +68,23 @@ export interface Venue {
   readonly feeNative: number;
 
   /**
-   * Every pool on the venue, fully paginated.
+   * Every pool the venue can see, priced as one instant.
    *
-   * Implementations MUST walk the venue's paging links to exhaustion rather
+   * Implementations MUST exhaust whatever enumeration their chain offers rather
    * than returning the first page. A partial pool set does not produce a
    * partial answer -- it produces confident wrong answers, because a cycle is
    * only detectable when every leg of it is present, and the pools that are
    * missing are unknowable from the pools that are not.
    *
-   * Read-only HTTP GET only.
+   * Where a chain offers no enumeration at all, "exhaust it" is not achievable
+   * and the implementation MUST say so in its own docs and report the shortfall
+   * every tick rather than let a bounded view read as a complete one. See
+   * XrplVenue, which can only reach pools among a checked-in seed list.
+   *
+   * READ-ONLY. Not by HTTP method -- one venue reads over a WebSocket, where
+   * method means nothing -- but by request vocabulary: an implementation may
+   * issue only calls that read ledger state, and test/check.ts asserts that
+   * against the source of every venue.
    */
   fetchPools(): Promise<Pool[]>;
 

@@ -1,9 +1,4 @@
-import {
-  MAX_TRADE_SIZE,
-  MIN_NET_PROFIT,
-  MIN_PROFIT_BPS,
-  SIZE_LADDER as CONFIGURED_LADDER,
-} from "./config.js";
+import { venueLimits } from "./config.js";
 import { other, type Pool, type Venue } from "./venue.js";
 
 /**
@@ -12,16 +7,6 @@ import { other, type Pool, type Venue } from "./venue.js";
  *
  * Route identity is issuer-qualified throughout. See routeKey below.
  */
-
-/**
- * The ladder, with rungs above the ceiling dropped.
- *
- * This filter is what keeps the two config constants from drifting apart, and
- * it fails safe in only one direction: a rung above MAX_TRADE_SIZE disappears
- * silently, so raising the ladder without raising the ceiling is a no-op with
- * no error and no log line. Move them together.
- */
-export const SIZE_LADDER = CONFIGURED_LADDER.filter((s) => s <= MAX_TRADE_SIZE);
 
 export interface Opportunity {
   venue: string;
@@ -72,17 +57,81 @@ export interface Opportunity {
   netProfit: number;
 }
 
+/**
+ * What to search, and how selective to be, IN ONE VENUE'S NATIVE ASSET.
+ *
+ * Every number here except minProfitBps is denominated: a ladder rung and a
+ * profit floor mean nothing without knowing what unit they are in. That is why
+ * the ladder lives on this interface rather than as a module constant -- one
+ * ladder shared across venues silently means "1000 of whatever this chain calls
+ * its coin", which is not one economic size. See VENUE_LIMITS in config.ts.
+ */
 export interface SearchLimits {
+  /** Input sizes to probe, in the venue's native asset. */
+  sizeLadder: readonly number[];
   minProfitBps: number;
   minNetProfit: number;
   maxSize: number;
+  /** Minimum native-side reserve for a pool to enter the graph. */
+  minPoolNative: number;
 }
 
-export const DEFAULT_LIMITS: SearchLimits = {
-  minProfitBps: MIN_PROFIT_BPS,
-  minNetProfit: MIN_NET_PROFIT,
-  maxSize: MAX_TRADE_SIZE,
-};
+/**
+ * The venue's configured limits, in the shape bestSize wants.
+ *
+ * Throws for a venue with no configured limits rather than substituting
+ * another's -- see venueLimits().
+ */
+export function limitsFor(venueName: string): SearchLimits {
+  const l = venueLimits(venueName);
+  return {
+    sizeLadder: l.sizeLadder,
+    minProfitBps: l.minProfitBps,
+    minNetProfit: l.minNetProfit,
+    maxSize: l.maxTradeSize,
+    minPoolNative: l.minPoolNative,
+  };
+}
+
+/**
+ * This pool's reserve of the venue's native asset, or null if it holds none.
+ *
+ * Null is the honest answer for a token-to-token pool, and it is not the same
+ * as zero: zero would mean "no depth" and get the pool dropped, when in fact
+ * the pool simply cannot be measured on this axis. See MIN_POOL_NATIVE_NOTE.
+ */
+export function nativeReserve(venue: Venue, pool: Pool): number | null {
+  if (pool.a === venue.nativeKey) return pool.ra;
+  if (pool.b === venue.nativeKey) return pool.rb;
+  return null;
+}
+
+/**
+ * Split pools into those deep enough to trade against and those that are not.
+ *
+ * THE PREDICATE LIVES HERE AND ONLY HERE. findOpportunities filters with it so
+ * that shallow pools never reach the graph, and monitor.ts counts with it so
+ * the heartbeat can say how many were dropped. Two implementations of "deep
+ * enough" would drift, and the drift would show up as a heartbeat that
+ * confidently reports a number describing a filter nobody applied.
+ *
+ * A pool with no native side is KEPT: it cannot be measured, and dropping
+ * everything unmeasurable would silently delete every triangular route.
+ */
+export function partitionByDepth(
+  venue: Venue,
+  pools: Pool[],
+  minPoolNative: number,
+): { deep: Pool[]; shallow: Pool[] } {
+  const deep: Pool[] = [];
+  const shallow: Pool[] = [];
+  for (const p of pools) {
+    const native = nativeReserve(venue, p);
+    if (native !== null && native < minPoolNative) shallow.push(p);
+    else deep.push(p);
+  }
+  return { deep, shallow };
+}
 
 /**
  * Probe every ladder rung for one route and keep the rung with the largest
@@ -118,7 +167,11 @@ function bestSize(
     netProfit: number;
   } | null = null;
 
-  for (const size of SIZE_LADDER) {
+  // Rungs above the ceiling are dropped here rather than at the ladder's
+  // definition, and the drop is silent in one direction only: raising a ladder
+  // without raising its venue's maxTradeSize is a no-op with no error and no
+  // log line. Move them together.
+  for (const size of limits.sizeLadder) {
     if (size > limits.maxSize) continue;
 
     const output = quote(size);
@@ -189,21 +242,30 @@ function cycleRateBound(pools: Pool[], from: string[]): number {
 export function findOpportunities(
   venue: Venue,
   pools: Pool[],
-  limits: SearchLimits = DEFAULT_LIMITS,
+  limits: SearchLimits = limitsFor(venue.name),
 ): Opportunity[] {
   const out: Opportunity[] = [];
   const native = venue.nativeKey;
   const fee = venue.feeNative;
 
-  // Never let a caller widen the ceiling, only narrow it.
+  // Never let a caller widen the ceiling, only narrow it -- and the ceiling it
+  // is measured against is THIS venue's, since a size is meaningless without
+  // the asset it is denominated in.
   const capped: SearchLimits = {
     ...limits,
-    maxSize: Math.min(limits.maxSize, MAX_TRADE_SIZE),
+    maxSize: Math.min(limits.maxSize, venueLimits(venue.name).maxTradeSize),
   };
+
+  // Depth floor FIRST, before the index is built, so a shallow pool is not
+  // merely absent from the results but absent from the graph -- it cannot be
+  // the middle leg of a triangle either. Filtering afterwards would leave the
+  // dust routes enumerated and then discarded, which costs the same time and
+  // still lets a puddle set the price of a cycle whose outer legs are deep.
+  const { deep } = partitionByDepth(venue, pools, capped.minPoolNative);
 
   // Index by asset for neighbour lookup.
   const byAsset = new Map<string, Pool[]>();
-  for (const p of pools) {
+  for (const p of deep) {
     for (const k of [p.a, p.b]) {
       const bucket = byAsset.get(k);
       if (bucket) bucket.push(p);
