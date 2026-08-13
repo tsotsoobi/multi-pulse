@@ -10,10 +10,10 @@
     "check": "tsx test/check.ts",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["stellar", "xrpl", "amm", "arbitrage", "monitoring", "read-only", "defi", "typescript"],
+  "author": "Adokwei Andrew Addo <46179822+tsotsoobi@users.noreply.github.com>",
   "license": "ISC",
-  "description": "",
+  "description": "Read-only multi-venue AMM opportunity monitor for Stellar and XRPL mainnet",
   "devDependencies": {
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
