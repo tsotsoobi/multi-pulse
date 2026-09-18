@@ -25,11 +25,18 @@ import {
   BaseVenue,
   RPC_METHODS,
   Rpc,
+  decodeAggregate3,
+  encodeAggregate3,
   toUnits,
   type RpcReply,
   type Transport,
 } from "../src/venues/base.js";
-import { BASE_FEE_NATIVE } from "../src/config.js";
+import {
+  AERODROME_POOL_FACTORY,
+  BASE_FEE_NATIVE,
+  MULTICALL3,
+  UNISWAP_V2_FACTORY,
+} from "../src/config.js";
 import type { Pool, Venue } from "../src/venue.js";
 import { readFileSync, readdirSync, rmSync, type Dirent } from "node:fs";
 import { tmpdir } from "node:os";
@@ -994,45 +1001,37 @@ try {
 check("the RPC gate throws on a method off the allow-list", gateThrew);
 check("and nothing at all reached the transport", gateSent === 0, `sent=${gateSent}`);
 
-// Batch mode: replies are matched by id, not by position.
-const shuffling: Transport = async (body) => {
-  const req = JSON.parse(body) as Array<{ id: number; method: string }>;
-  return {
-    status: 200,
-    json: [...req].reverse().map((r) => ({ jsonrpc: "2.0", id: r.id, result: r.method })),
-  };
+// No JSON-RPC batching: each call is one POST of a single object, in order,
+// and its reply is matched by id.
+const posted: unknown[] = [];
+const echoing: Transport = async (body) => {
+  const req = JSON.parse(body) as { id: number; method: string };
+  posted.push(req);
+  return { status: 200, json: { jsonrpc: "2.0", id: req.id, result: req.method } };
 };
-const batchRpc = new Rpc(shuffling);
-const batchReplies: RpcReply[] = await batchRpc.send(
+const singleReplies: RpcReply[] = await new Rpc(echoing).send(
   [{ method: "eth_chainId", params: [] }, { method: "eth_blockNumber", params: [] }],
   new AbortController().signal,
 );
-check("a batch reply is matched back to request order by id",
-  batchRpc.mode === "batch" &&
-    batchReplies.map((r) => (r.ok ? r.result : "ERR")).join(",") === "eth_chainId,eth_blockNumber",
-  JSON.stringify(batchReplies));
+check("send() posts one single JSON-RPC object per call, never an array",
+  posted.length === 2 && posted.every((p) => !Array.isArray(p) && typeof p === "object"),
+  JSON.stringify(posted));
+check("each reply is matched to its call by id, in call order",
+  singleReplies.map((r) => (r.ok ? r.result : "ERR")).join(",") === "eth_chainId,eth_blockNumber",
+  JSON.stringify(singleReplies));
 
-// Sequential fallback when the endpoint refuses batches.
-const seen: string[] = [];
-const noBatches: Transport = async (body) => {
-  const req = JSON.parse(body) as { id: number; method: string } | unknown[];
-  if (Array.isArray(req)) {
-    seen.push("batch");
-    return { status: 400, json: { error: { code: -32600, message: "batch not supported" } } };
-  }
-  seen.push(req.method);
-  return { status: 200, json: { jsonrpc: "2.0", id: req.id, result: "0x10" } };
+// A reply carrying some other request's id is an error, not an answer.
+const wrongId: Transport = async (body) => {
+  const req = JSON.parse(body) as { id: number };
+  return { status: 200, json: { jsonrpc: "2.0", id: req.id + 1000, result: "0x2105" } };
 };
-const seqRpc = new Rpc(noBatches);
-const seqReplies = await seqRpc.send(
-  [{ method: "eth_blockNumber", params: [] }, { method: "eth_chainId", params: [] }],
+const [mismatched] = await new Rpc(wrongId).send(
+  [{ method: "eth_chainId", params: [] }],
   new AbortController().signal,
 );
-check("a refused batch falls back to sequential calls",
-  seqRpc.mode === "sequential" &&
-    seen.join(",") === "batch,eth_blockNumber,eth_chainId" &&
-    seqReplies.every((r) => r.ok && r.result === "0x10"),
-  `${seqRpc.mode} ${seen.join(",")}`);
+check("a reply with the wrong id is an error",
+  mismatched !== undefined && !mismatched.ok,
+  JSON.stringify(mismatched));
 
 // The whole tick is under a hard deadline, including a transport that never
 // answers at all.
@@ -1090,6 +1089,311 @@ const baseSizes = ladderProbe(bv, WETH_KEY);
 check("base sizes come off the base ladder",
   baseSizes.length > 0 && baseSizes.every((s) => B.sizeLadder.includes(s)),
   baseSizes.join(","));
+
+// ---------------------------------------------------------------------------
+// 11b. MULTICALL3 AND THE eth_call BUDGET.
+//
+// mainnet.base.org allows roughly five eth_call per time window (FINDINGS.md
+// section 6), so every contract read goes through one aggregate3 call. These
+// checks pin the encoding by hand, pin the only Multicall3 function allowed,
+// and count eth_calls against a fake chain so a later edit cannot quietly
+// raise the budget: start() at most 3, start plus first tick at most 4, an
+// unverified tick at most 4, a normal tick exactly 1.
+// ---------------------------------------------------------------------------
+
+const w = (hex: string): string => hex.padStart(64, "0");
+const wa = (addr: string): string => w(addr.slice(2).toLowerCase());
+
+// Encoding, laid out word by word by hand: WETH.decimals() (4 bytes of data)
+// and UniswapV2Factory.getPair(WETH, USDC) (4 + 64 = 68 = 0x44 bytes).
+const GET_PAIR_WETH_USDC = "e6a43905" + wa(WETH_KEY) + wa(USDC_KEY);
+const expectedCalldata = "0x82ad56cb" + [
+  w("20"), // offset of the array
+  w("2"), // two sub-calls
+  w("40"), // element 0 starts right after the two offset words
+  w("e0"), // element 1: 0x40 + element 0's five words (0xa0)
+  // element 0
+  wa(WETH_KEY), w("1"), w("60"), w("4"), "313ce567".padEnd(64, "0"),
+  // element 1: 0x44 bytes of data, padded to three words
+  wa(UNISWAP_V2_FACTORY), w("1"), w("60"), w("44"), GET_PAIR_WETH_USDC.padEnd(192, "0"),
+].join("");
+const encoded = encodeAggregate3([
+  { target: WETH_KEY, data: "313ce567" },
+  { target: UNISWAP_V2_FACTORY, data: GET_PAIR_WETH_USDC },
+]);
+check("aggregate3 encoding of two sub-calls matches the hand-built hex",
+  encoded === expectedCalldata, encoded);
+
+// Decoding: one success carrying a word, one failure with empty returnData.
+const RESULT_HEX = [
+  w("20"), w("2"), w("40"), w("c0"),
+  w("1"), w("40"), w("20"), w("12"), // entry 0: success, 32 bytes
+  w("0"), w("40"), w("0"), // entry 1: failure, empty returnData
+].join("");
+const decoded = decodeAggregate3(RESULT_HEX, 2);
+check("aggregate3 decoding: a success and a failure with empty returnData",
+  decoded.length === 2 && decoded[0] === w("12") && decoded[1] === null,
+  JSON.stringify(decoded));
+const emptySuccess = decodeAggregate3([w("20"), w("1"), w("20"), w("1"), w("40"), w("0")].join(""), 1);
+check("aggregate3 decoding: success with empty returnData is \"\", not null",
+  emptySuccess.length === 1 && emptySuccess[0] === "", JSON.stringify(emptySuccess));
+
+const throwsOn = (fn: () => unknown): boolean => {
+  try {
+    fn();
+    return false;
+  } catch {
+    return true;
+  }
+};
+check("aggregate3 decoding throws on a truncated result",
+  throwsOn(() => decodeAggregate3(RESULT_HEX.slice(0, -64), 2)));
+check("aggregate3 decoding throws on a success word of 2",
+  throwsOn(() => decodeAggregate3(RESULT_HEX.replace(w("0") + w("40") + w("0"), w("2") + w("40") + w("0")), 2)));
+check("aggregate3 decoding throws when the entry count is not the call count",
+  throwsOn(() => decodeAggregate3(RESULT_HEX, 3)));
+
+// aggregate3 is the only Multicall3 function base.ts may use. Every other
+// Multicall3 selector, each computed from the prototype beside it.
+const MULTICALL3_OTHER_SELECTORS = [
+  "252dba42", // aggregate((address,bytes)[])
+  "174dea71", // aggregate3Value((address,bool,uint256,bytes)[])
+  "c3077fa9", // blockAndAggregate((address,bytes)[])
+  "3e64a696", // getBasefee()
+  "ee82ac5e", // getBlockHash(uint256)
+  "42cbb15c", // getBlockNumber()
+  "3408e470", // getChainId()
+  "a8b0574e", // getCurrentBlockCoinbase()
+  "72425d9d", // getCurrentBlockDifficulty()
+  "86d516e8", // getCurrentBlockGasLimit()
+  "0f28c97d", // getCurrentBlockTimestamp()
+  "4d2301cc", // getEthBalance(address)
+  "27e86d6e", // getLastBlockHash()
+  "bce38bd7", // tryAggregate(bool,(address,bytes)[])
+  "399542e9", // tryBlockAndAggregate(bool,(address,bytes)[])
+];
+const baseLower = baseRaw.toLowerCase();
+const otherSelectors = MULTICALL3_OTHER_SELECTORS.filter((s) => baseLower.includes(s));
+check("aggregate3 (82ad56cb) is the only Multicall3 selector in base.ts",
+  baseLower.includes("82ad56cb") && otherSelectors.length === 0, otherSelectors.join(","));
+const otherNames = ["aggregate3Value", "aggregate(", "tryAggregate"].filter((s) =>
+  baseLower.includes(s.toLowerCase()),
+);
+check("base.ts never names aggregate3Value, aggregate( or tryAggregate",
+  otherNames.length === 0, otherNames.join(", "));
+
+// A fake Base chain behind a counting transport. It reads aggregate3 calldata
+// with its own decoder, not base.ts's, and answers each sub-call from a table.
+const CBBTC_KEY = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf";
+const AERO_KEY = "0x940181a94a35a4569e4529a3cdfb74e38fd98631";
+const UNI_F = UNISWAP_V2_FACTORY.toLowerCase();
+const AERO_F = AERODROME_POOL_FACTORY.toLowerCase();
+const POOL_UNI = "0x" + "a1".repeat(20);
+const POOL_AERO_1 = "0x" + "b1".repeat(20);
+const POOL_AERO_2 = "0x" + "b2".repeat(20);
+const FAKE_BLOCK = "0x100";
+
+const FAKE_TOKENS: Record<string, { symbol: string; decimals: number }> = {
+  [WETH_KEY]: { symbol: "WETH", decimals: 18 },
+  [USDC_KEY]: { symbol: "USDC", decimals: 6 },
+  [CBBTC_KEY]: { symbol: "cbBTC", decimals: 8 },
+  [AERO_KEY]: { symbol: "AERO", decimals: 18 },
+};
+const FAKE_POOLS: Record<string, { aero: boolean; t0: string; t1: string; r0: bigint; r1: bigint }> = {
+  [POOL_UNI]: { aero: false, t0: WETH_KEY, t1: USDC_KEY, r0: 1_000n * 10n ** 18n, r1: 3_000_000n * 10n ** 6n },
+  [POOL_AERO_1]: { aero: true, t0: WETH_KEY, t1: USDC_KEY, r0: 500n * 10n ** 18n, r1: 1_500_000n * 10n ** 6n },
+  [POOL_AERO_2]: { aero: true, t0: USDC_KEY, t1: AERO_KEY, r0: 1_000_000n * 10n ** 6n, r1: 2_000_000n * 10n ** 18n },
+};
+const FAKE_FEE_BP = 30n;
+
+interface FakeSub {
+  target: string;
+  allowFailure: boolean;
+  data: string;
+}
+
+function readAggregate3(data: string): FakeSub[] {
+  const hex = data.slice(2);
+  if (hex.slice(0, 8) !== "82ad56cb") throw new Error(`fake: selector ${hex.slice(0, 8)}`);
+  const body = hex.slice(8);
+  const num = (byte: number): number => Number(BigInt("0x" + body.slice(byte * 2, byte * 2 + 64)));
+  const array = num(0);
+  const heads = array + 32;
+  const subs: FakeSub[] = [];
+  for (let i = 0; i < num(array); i++) {
+    const el = heads + num(heads + 32 * i);
+    const dataAt = el + num(el + 64);
+    subs.push({
+      target: "0x" + body.slice(el * 2 + 24, el * 2 + 64),
+      allowFailure: num(el + 32) === 1,
+      data: body.slice((dataAt + 32) * 2, (dataAt + 32 + num(dataAt)) * 2),
+    });
+  }
+  return subs;
+}
+
+function writeResults(results: Array<string | null>): string {
+  const heads: string[] = [];
+  const tails: string[] = [];
+  let offset = results.length * 32;
+  for (const r of results) {
+    const data = r ?? "";
+    const el = w(r === null ? "0" : "1") + w("40") + w((data.length / 2).toString(16)) +
+      data.padEnd(Math.ceil(data.length / 64) * 64, "0");
+    heads.push(w(offset.toString(16)));
+    tails.push(el);
+    offset += el.length / 2;
+  }
+  return "0x" + w("20") + w(results.length.toString(16)) + heads.join("") + tails.join("");
+}
+
+function fakeAnswer(s: FakeSub, reverts: Set<string>): string | null {
+  const target = s.target.toLowerCase();
+  const sel = s.data.slice(0, 8);
+  const args = s.data.slice(8);
+  const argAddr = (i: number): string => "0x" + args.slice(i * 64 + 24, i * 64 + 64);
+  const argUint = (i: number): bigint => BigInt("0x" + args.slice(i * 64, i * 64 + 64));
+  if (reverts.has(`${target}:${sel}`)) return null;
+
+  const token = FAKE_TOKENS[target];
+  if (token && sel === "95d89b41") {
+    const text = Buffer.from(token.symbol, "utf8").toString("hex");
+    return w("20") + w((text.length / 2).toString(16)) + text.padEnd(64, "0");
+  }
+  if (token && sel === "313ce567") return w(token.decimals.toString(16));
+
+  const lookup = (aero: boolean): string => {
+    const [a, b] = [argAddr(0), argAddr(1)];
+    const hit = Object.entries(FAKE_POOLS).find(([, p]) =>
+      p.aero === aero && ((p.t0 === a && p.t1 === b) || (p.t0 === b && p.t1 === a)),
+    );
+    return wa(hit ? hit[0] : "0x" + "0".repeat(40));
+  };
+  if (target === UNI_F && sel === "e6a43905") return lookup(false);
+  if (target === AERO_F && sel === "79bc57d5") return argUint(2) === 0n ? lookup(true) : wa("0x" + "0".repeat(40));
+  if (target === AERO_F && sel === "cc56b2c5") return w(FAKE_FEE_BP.toString(16));
+
+  const pool = FAKE_POOLS[target];
+  if (!pool) return null;
+  if (sel === "0dfe1681") return wa(pool.t0);
+  if (sel === "d21220a7") return wa(pool.t1);
+  if (sel === "c45a0155") return wa(pool.aero ? AERO_F : UNI_F);
+  if (sel === "0902f1ac") return w(pool.r0.toString(16)) + w(pool.r1.toString(16)) + w("1");
+  if (pool.aero && sel === "22be3de1") return w("0");
+  if (pool.aero && sel === "f140a35a") {
+    const tokenIn = argAddr(1);
+    const [rIn, rOut] = tokenIn === pool.t0 ? [pool.r0, pool.r1] : [pool.r1, pool.r0];
+    const inNet = argUint(0) - (argUint(0) * FAKE_FEE_BP) / 10_000n;
+    return w(((inNet * rOut) / (rIn + inNet)).toString(16));
+  }
+  return null;
+}
+
+function fakeBase() {
+  const state = {
+    counts: {} as Record<string, number>,
+    calls: [] as Array<{ to: string; selector: string; tag: string; subs: FakeSub[] }>,
+    rateLimited: false,
+    reverts: new Set<string>(),
+  };
+  const transport: Transport = async (body) => {
+    const req = JSON.parse(body) as { id: number; method: string; params: any[] };
+    state.counts[req.method] = (state.counts[req.method] ?? 0) + 1;
+    const reply = (x: object) => ({ status: 200, json: { jsonrpc: "2.0", id: req.id, ...x } });
+    if (req.method === "eth_chainId") return reply({ result: "0x2105" });
+    if (req.method === "eth_blockNumber") return reply({ result: FAKE_BLOCK });
+    if (state.rateLimited) return reply({ error: { code: -32016, message: "over rate limit" } });
+    const [{ to, data }, tag] = req.params as [{ to: string; data: string }, string];
+    const subs = readAggregate3(data);
+    state.calls.push({ to, selector: data.slice(2, 10), tag, subs });
+    return reply({ result: writeResults(subs.map((s) => fakeAnswer(s, state.reverts))) });
+  };
+  return { state, transport };
+}
+
+const ethCalls = (s: { counts: Record<string, number> }): number => s.counts["eth_call"] ?? 0;
+
+// The budget, on a fake chain with one Uniswap pool and two Aerodrome pools.
+const fb = fakeBase();
+const fbv = new BaseVenue({ transport: fb.transport });
+await fbv.start();
+const startCalls = ethCalls(fb.state);
+check("start() makes at most 3 eth_calls", startCalls > 0 && startCalls <= 3, `eth_call=${startCalls}`);
+const firstTick = await fbv.fetchPools();
+check("start() plus the first tick make at most 4 eth_calls",
+  ethCalls(fb.state) <= 4, `eth_call=${ethCalls(fb.state)}`);
+check("the fake chain verifies and prices all three pools",
+  firstTick.length === 3 && fbv.dropped.length === 0 && !fbv.fetchNote().includes("NOT_VERIFIED"),
+  `${firstTick.length} pools; ${JSON.stringify(fbv.dropped)}`);
+
+const countsBefore = { ...fb.state.counts };
+await fbv.fetchPools();
+const delta = (m: string): number => (fb.state.counts[m] ?? 0) - (countsBefore[m] ?? 0);
+check("a normal tick makes exactly 1 eth_call and 1 eth_blockNumber",
+  delta("eth_call") === 1 && delta("eth_blockNumber") === 1 && delta("eth_chainId") === 0,
+  `eth_call=${delta("eth_call")} eth_blockNumber=${delta("eth_blockNumber")}`);
+check("every eth_call is aggregate3 on MULTICALL3, pinned to the block just read",
+  fb.state.calls.every((c) =>
+    c.to.toLowerCase() === MULTICALL3.toLowerCase() && c.selector === "82ad56cb" && c.tag === FAKE_BLOCK),
+  JSON.stringify(fb.state.calls.map((c) => [c.to, c.selector, c.tag])));
+check("every sub-call is sent with allowFailure = true",
+  fb.state.calls.every((c) => c.subs.length > 0 && c.subs.every((s) => s.allowFailure)));
+
+// A tick that has to verify first (start() failed) stays inside the allowance too.
+const fu = fakeBase();
+const unverifiedTick = await new BaseVenue({ transport: fu.transport }).fetchPools();
+check("an unverified tick makes at most 4 eth_calls",
+  ethCalls(fu.state) <= 4 && unverifiedTick.length === 3,
+  `eth_call=${ethCalls(fu.state)} pools=${unverifiedTick.length}`);
+
+// success = false is a revert: that token is dropped and named, and the pool
+// lookups that rode in the same call for it are discarded, not tracked.
+const fr = fakeBase();
+fr.state.reverts.add(`${AERO_KEY}:95d89b41`);
+const frv = new BaseVenue({ transport: fr.transport });
+await frv.start();
+const frPools = await frv.fetchPools();
+check("a reverted symbol() drops that token by name",
+  frv.dropped.some((d) => d.what.startsWith("token AERO")), JSON.stringify(frv.dropped));
+check("and no pool involving the dropped token is tracked",
+  frPools.length === 2 && frPools.every((p) => p.a !== AERO_KEY && p.b !== AERO_KEY),
+  frPools.map((p) => p.id).join(","));
+
+// A reverted read during a tick loses that pool for the tick only.
+fb.state.reverts.add(`${POOL_UNI}:0902f1ac`);
+const revertedTick = await fbv.fetchPools();
+check("a reverted getReserves() in a tick is counted and its pool left out",
+  revertedTick.length === 2 && fbv.lastRead.errors === 1 && fbv.fetchNote().includes("call_errors=1"),
+  fbv.fetchNote());
+fb.state.reverts.clear();
+
+// An error on the eth_call itself, "over rate limit" included, fails the whole
+// verification or tick, and the next tick verifies again.
+const fl = fakeBase();
+fl.state.rateLimited = true;
+const flv = new BaseVenue({ transport: fl.transport });
+let startError = "";
+try {
+  await flv.start();
+} catch (e: any) {
+  startError = e?.message ?? String(e);
+}
+check("a rate-limited start() rejects and leaves the venue unverified",
+  /over rate limit/.test(startError) && flv.fetchNote().includes("NOT_VERIFIED"), startError);
+let tickError = "";
+fb.state.rateLimited = true;
+try {
+  await fbv.fetchPools();
+} catch (e: any) {
+  tickError = e?.message ?? String(e);
+}
+fb.state.rateLimited = false;
+check("a rate-limited tick rejects as a whole rather than returning a partial tick",
+  /over rate limit/.test(tickError), tickError);
+fl.state.rateLimited = false;
+const recovered = await flv.fetchPools();
+check("the next tick after a rate-limited start() verifies and prices",
+  recovered.length === 3 && !flv.fetchNote().includes("NOT_VERIFIED"), flv.fetchNote());
 
 console.log(fail === 0 ? "\nall checks passed" : `\n${fail} FAILED`);
 process.exit(fail === 0 ? 0 : 1);

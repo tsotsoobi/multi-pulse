@@ -136,7 +136,7 @@ looked up in both factories. At startup it confirms the chain id, each token's `
 and `decimals()`, each pool's `token0`/`token1` and factory, and that each Aerodrome
 pool's own `getAmountOut` quote agrees with this program's arithmetic to 0.01%. Anything
 that fails is dropped and counted. Each tick reads every reserve and every Aerodrome fee
-pinned to one block, batched where the endpoint allows it, under a 15-second deadline.
+pinned to one block, in one Multicall3 aggregate3 call per tick, under a 15-second deadline.
 Read a quiet Base tick as "quiet among these four tokens".
 
 ## How detection works

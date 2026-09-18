@@ -882,8 +882,22 @@ export const BASE_FEE_NATIVE = 0.00005;
  */
 export const BASE_TICK_TIMEOUT_MS = 15_000;
 
-/** Calls per JSON-RPC batch. A normal tick needs at most 19. */
-export const BASE_BATCH_MAX = 20;
+/**
+ * Multicall3 on Base, the same address as on most EVM chains. Listed on
+ * docs.base.org among Base's chain contracts, with verified source on basescan.
+ *
+ * WHY EVERY CONTRACT READ GOES THROUGH IT. mainnet.base.org allows roughly five
+ * eth_call per time window (between several seconds and 60 s; measured
+ * 18 September 2026, see FINDINGS.md section 6), while eth_chainId and
+ * eth_blockNumber are not counted against it. The first live run asked one
+ * eth_call per contract read, was refused at the 6th, and never verified.
+ * Through aggregate3 a normal tick costs one eth_call and start() at most three.
+ *
+ * Not checked on-chain at startup: that would need eth_getCode, which is off the
+ * allow-list. A wrong address answers "0x", which fails to decode, so every
+ * tick would fail loudly rather than drop anything silently.
+ */
+export const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
 /**
  * Largest relative gap allowed at startup between our simulate() and an

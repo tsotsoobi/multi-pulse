@@ -1,6 +1,5 @@
 import {
   AERODROME_POOL_FACTORY,
-  BASE_BATCH_MAX,
   BASE_CHAIN_ID,
   BASE_FEE_NATIVE,
   BASE_QUOTE_MIN_OUT_RAW,
@@ -9,6 +8,7 @@ import {
   BASE_RPC_URL,
   BASE_SEED_TOKENS,
   BASE_TICK_TIMEOUT_MS,
+  MULTICALL3,
   UNISWAP_V2_FACTORY,
   UNISWAP_V2_FEE_BP,
 } from "../config.js";
@@ -28,6 +28,12 @@ import type { Pool, Venue } from "../venue.js";
  * The transport is HTTP POST, unlike Horizon's GET, because that is how
  * JSON-RPC is carried. As on XRPL, the method name is what makes a request a
  * read, not the HTTP verb.
+ *
+ * ONE eth_call PER TICK. The public endpoint allows roughly five eth_call per
+ * time window (see MULTICALL3 in config.ts), so every contract read is wrapped
+ * in a single Multicall3 aggregate3 call, pinned to the tick's block: exactly
+ * one eth_call per normal tick, at most three in start(). test/check.ts counts
+ * them. aggregate3 is the only Multicall3 function this file may use.
  *
  * Pools: Uniswap V2 pairs and Aerodrome VOLATILE pools, both constant product.
  * Aerodrome stable pools, Uniswap v3 and concentrated-liquidity pools are out of
@@ -60,6 +66,7 @@ const SEL = {
   getAmountOut: "f140a35a", // getAmountOut(uint256,address)
   symbol: "95d89b41", // symbol()
   decimals: "313ce567", // decimals()
+  aggregate3: "82ad56cb", // aggregate3((address,bool,bytes)[])
 } as const;
 
 /** WETH, the cycle anchor. A protocol predeploy; also first in the seed list. */
@@ -94,8 +101,6 @@ export type Transport = (
   abort: AbortSignal,
 ) => Promise<{ status: number; json: unknown }>;
 
-export type RpcMode = "batch" | "sequential";
-
 function httpTransport(url: string): Transport {
   return async (body, abort) => {
     const res = await fetch(url, {
@@ -110,9 +115,6 @@ function httpTransport(url: string): Transport {
 }
 
 export class Rpc {
-  /** "sequential" once any batch since the last resetMode() was refused. */
-  mode: RpcMode = "batch";
-
   private readonly transport: Transport;
   private nextId = 1;
 
@@ -120,23 +122,15 @@ export class Rpc {
     this.transport = transport;
   }
 
-  resetMode(): void {
-    this.mode = "batch";
-  }
-
   /**
    * THE ONLY PATH TO THE NETWORK. Every method is checked against RPC_METHODS
    * before anything is sent, and one bad method refuses the whole call rather
    * than sending the good ones first.
    *
-   * Calls go out as JSON-RPC batches of up to BASE_BATCH_MAX. If the endpoint
-   * refuses a batch -- an HTTP error, a reply that is not an array, or one whose
-   * ids do not match -- the same calls are resent one at a time and the mode
-   * becomes "sequential". A per-call error inside an accepted batch (a revert,
-   * say) is that call's answer, not a refusal of batching.
-   *
-   * Replies come back in the order of `calls`, whatever order the endpoint
-   * used.
+   * Each call is one HTTP POST of a single JSON-RPC object, in order. There is
+   * no JSON-RPC batching: since every contract read travels inside one
+   * aggregate3 eth_call, no caller has more than one call to send at a time.
+   * A reply whose id does not match its request is answered as an error.
    */
   async send(calls: readonly RpcCall[], abort: AbortSignal): Promise<RpcReply[]> {
     for (const c of calls) {
@@ -148,49 +142,28 @@ export class Rpc {
     }
 
     const out: RpcReply[] = [];
-    for (let start = 0; start < calls.length; start += BASE_BATCH_MAX) {
-      const envelopes = calls.slice(start, start + BASE_BATCH_MAX).map((c) => ({
-        jsonrpc: "2.0",
-        id: this.nextId++,
-        method: c.method,
-        params: c.params,
-      }));
-
-      const batch = await this.transport(JSON.stringify(envelopes), abort);
-      const matched = matchBatch(batch, envelopes.map((e) => e.id));
-      if (matched) {
-        out.push(...matched);
-        continue;
+    for (const c of calls) {
+      const id = this.nextId++;
+      const res = await this.transport(
+        JSON.stringify({ jsonrpc: "2.0", id, method: c.method, params: c.params }),
+        abort,
+      );
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`base: HTTP ${res.status} for ${c.method}`);
       }
-
-      this.mode = "sequential";
-      for (const e of envelopes) {
-        const one = await this.transport(JSON.stringify(e), abort);
-        if (one.status < 200 || one.status >= 300) {
-          throw new Error(`base: HTTP ${one.status} for ${e.method}`);
-        }
-        out.push(toReply(one.json));
-      }
+      const replyId = (res.json as { id?: unknown } | null)?.id;
+      out.push(
+        replyId === id
+          ? toReply(res.json)
+          : {
+              ok: false,
+              code: null,
+              message: `reply id ${JSON.stringify(replyId)}, expected ${id}`,
+            },
+      );
     }
     return out;
   }
-}
-
-/** The batch reply in request order, or null if the batch was refused. */
-function matchBatch(
-  res: { status: number; json: unknown },
-  ids: number[],
-): RpcReply[] | null {
-  if (res.status < 200 || res.status >= 300) return null;
-  if (!Array.isArray(res.json) || res.json.length !== ids.length) return null;
-
-  const byId = new Map<number, unknown>();
-  for (const r of res.json) {
-    const id = (r as { id?: unknown } | null)?.id;
-    if (typeof id === "number") byId.set(id, r);
-  }
-  if (!ids.every((id) => byId.has(id))) return null;
-  return ids.map((id) => toReply(byId.get(id)));
 }
 
 function toReply(x: unknown): RpcReply {
@@ -252,11 +225,89 @@ function hexTag(n: number): string {
   return "0x" + n.toString(16);
 }
 
-function ethCall(to: string, selector: string, args: string[], blockTag: string): RpcCall {
-  return {
-    method: "eth_call",
-    params: [{ to, data: "0x" + selector + args.join("") }, blockTag],
+/** One contract read inside an aggregate3 call. `data` is hex without 0x. */
+export interface SubCall {
+  target: string;
+  data: string;
+}
+
+function sub(target: string, selector: string, args: string[] = []): SubCall {
+  return { target, data: selector + args.join("") };
+}
+
+/**
+ * Calldata for Multicall3 aggregate3((address,bool,bytes)[]), by hand.
+ *
+ *   selector
+ *   0x20                    offset of the array
+ *   n                       array length
+ *   n offsets               each from the word after the length to its element
+ *   n elements              target, allowFailure, 0x60 (offset of the bytes
+ *                           within the element), bytes length, bytes padded
+ *                           right to a whole word
+ *
+ * allowFailure is always 1 and is not a parameter: a read that reverts must
+ * come back as success = false, never take the other reads down with it.
+ */
+export function encodeAggregate3(calls: readonly SubCall[]): string {
+  const heads: string[] = [];
+  const tails: string[] = [];
+  let offset = calls.length * 32;
+  for (const c of calls) {
+    const bytes = c.data.length / 2;
+    const padded = c.data.toLowerCase().padEnd(Math.ceil(bytes / 32) * 64, "0");
+    const element =
+      encAddress(c.target) + encBool(true) + encUint(0x60n) + encUint(BigInt(bytes)) + padded;
+    heads.push(encUint(BigInt(offset)));
+    tails.push(element);
+    offset += element.length / 2;
+  }
+  const head = SEL.aggregate3 + encUint(0x20n) + encUint(BigInt(calls.length));
+  return "0x" + head + heads.join("") + tails.join("");
+}
+
+/**
+ * The (bool success, bytes returnData)[] an aggregate3 call returns, as one
+ * entry per sub-call: the returnData hex (without 0x, possibly empty) where
+ * success is true, null where it is false.
+ *
+ * Every offset and length is checked against the payload, each success word
+ * must be exactly 0 or 1, and there must be exactly `n` entries. Anything else
+ * THROWS: a reply we cannot read is a failure of the whole call, retried next
+ * time, never a set of individual reverts.
+ */
+export function decodeAggregate3(hex: string, n: number): Array<string | null> {
+  const bad = (why: string): never => {
+    throw new Error(`base: aggregate3 result malformed: ${why}`);
   };
+  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) bad("not hex");
+  const size = hex.length / 2;
+
+  // A word at a byte position, which must lie inside the payload and, since
+  // every word read here is an offset, a length or a bool, be no larger than it.
+  const at = (byte: number): number => {
+    if (byte + 32 > size) bad(`word at byte ${byte} is past the end (${size} bytes)`);
+    const w = BigInt("0x" + hex.slice(byte * 2, byte * 2 + 64));
+    if (w > BigInt(size)) bad(`word at byte ${byte} is ${w}, larger than the payload`);
+    return Number(w);
+  };
+
+  const array = at(0);
+  const len = at(array);
+  if (len !== n) bad(`${len} results for ${n} calls`);
+  const heads = array + 32;
+
+  const out: Array<string | null> = [];
+  for (let i = 0; i < n; i++) {
+    const element = heads + at(heads + 32 * i);
+    const success = at(element);
+    if (success > 1) bad(`success word ${success} in entry ${i}`);
+    const dataAt = element + at(element + 32);
+    const dataLen = at(dataAt);
+    if (dataAt + 32 + dataLen > size) bad(`returnData of entry ${i} runs past the end`);
+    out.push(success === 1 ? hex.slice((dataAt + 32) * 2, (dataAt + 32 + dataLen) * 2) : null);
+  }
+  return out;
 }
 
 /** The hex payload of a reply without its 0x, or null if it is not hex. */
@@ -326,17 +377,6 @@ export function toUnits(raw: bigint, decimals: number): number {
   return Number(raw / scale) + Number(raw % scale) / Number(scale);
 }
 
-/**
- * The payload of a reply during verification, or null for a DEFINITE "no"
- * (a revert). Any other error is transient and throws, so verification fails
- * as a whole and is retried next tick, rather than a timeout permanently
- * dropping a pool or token that is actually fine.
- */
-function definite(r: RpcReply, what: string): string | null {
-  if (r.ok) return payload(r);
-  if (r.code === 3 || /revert/i.test(r.message)) return null;
-  throw new Error(`base: ${what} failed: ${r.message}`);
-}
 
 // ---------------------------------------------------------------------------
 // The venue
@@ -363,11 +403,10 @@ interface TrackedPool {
 export interface BaseReadStats {
   /** Block every reply in the tick was pinned to, or 0 before the first tick. */
   block: number;
-  mode: RpcMode | "none";
   /** Pools returned, per dex. */
   uni: number;
   aero: number;
-  /** Calls that failed this tick; their pools are missing from it. */
+  /** Sub-calls that reverted this tick; their pools are missing from it. */
   errors: number;
   /** Pools whose reply could not be priced (empty, bad fee). */
   skipped: number;
@@ -391,7 +430,6 @@ export class BaseVenue implements Venue {
 
   lastRead: BaseReadStats = {
     block: 0,
-    mode: "none",
     uni: 0,
     aero: 0,
     errors: 0,
@@ -461,7 +499,7 @@ export class BaseVenue implements Venue {
   fetchNote(): string {
     const r = this.lastRead;
     return (
-      ` block=${r.block || "none"} rpc=${r.mode}` +
+      ` block=${r.block || "none"}` +
       ` tokens=${this.tokens.length}/${BASE_SEED_TOKENS.length}` +
       ` uni=${r.uni} aero=${r.aero} absent=${this.absent}` +
       ` dropped=${this.dropped.length}` +
@@ -481,19 +519,53 @@ export class BaseVenue implements Venue {
   }
 
   /**
-   * Startup verification, pinned to one block:
+   * Every read in `calls` as ONE eth_call to Multicall3 aggregate3, pinned to
+   * `tag`. Returns one entry per sub-call: its returnData hex, or null where it
+   * reverted (success = false).
    *
-   *   1. eth_chainId is 8453.
-   *   2. every seed token's symbol() and decimals() match the seed list.
-   *   3. pools are looked up for every pair of surviving tokens; a zero address
+   * An error on the eth_call itself, "over rate limit" included, or a result
+   * that does not decode, THROWS: it says nothing about any one token or pool,
+   * so the whole verification or tick fails and is retried next time. An empty
+   * list sends nothing.
+   */
+  private async multicall(
+    calls: readonly SubCall[],
+    tag: string,
+    abort: AbortSignal,
+  ): Promise<Array<string | null>> {
+    if (calls.length === 0) return [];
+    const [r] = await this.rpc.send(
+      [{ method: "eth_call", params: [{ to: MULTICALL3, data: encodeAggregate3(calls) }, tag] }],
+      abort,
+    );
+    const hex = r ? payload(r) : null;
+    if (hex === null) {
+      throw new Error(
+        `base: aggregate3 of ${calls.length} reads failed: ${r ? describe(r) : "no reply"}`,
+      );
+    }
+    return decodeAggregate3(hex, calls.length);
+  }
+
+  /**
+   * Startup verification, pinned to one block, in at most three eth_calls:
+   *
+   *   1. eth_chainId is 8453 (not an eth_call).
+   *   2. first aggregate3: every seed token's symbol() and decimals(), AND the
+   *      factory lookups for every pair of seeds. The lookups do not depend on
+   *      the token checks, so they ride in the same call; a pool involving a
+   *      token that fails its check is discarded afterwards. A zero address
    *      means no pool and is not an error.
-   *   4. each pool's token0/token1 are the pair it was found by, its factory()
-   *      is the factory that returned it, and an Aerodrome pool is not stable.
-   *   5. each Aerodrome pool's own getAmountOut agrees with our simulate() to
-   *      within BASE_QUOTE_TOLERANCE. This also proves getFee's units.
+   *   3. second aggregate3: each pool's token0/token1 are the pair it was found
+   *      by, its factory() is the factory that returned it, and an Aerodrome
+   *      pool is not stable. Aerodrome getReserves() and getFee() ride along;
+   *      they are used only for pools that pass.
+   *   4. third aggregate3: each Aerodrome pool's own getAmountOut agrees with
+   *      our simulate() to within BASE_QUOTE_TOLERANCE. This also proves
+   *      getFee's units.
    *
-   * A mismatch drops that token or pool and is reported. A transient failure
-   * throws, and the whole verification runs again next tick.
+   * A reverted read or a mismatch drops that token or pool and is reported. A
+   * failed eth_call throws, and the whole verification runs again next tick.
    */
   private async verify(abort: AbortSignal): Promise<void> {
     this.verified = false;
@@ -513,25 +585,38 @@ export class BaseVenue implements Venue {
 
     const tag = hexTag(await this.blockNumber(abort));
 
-    // 2. tokens
+    // 2. tokens and pool lookups, every unordered pair of seeds, both factories
     const seeds = BASE_SEED_TOKENS.filter((s) => {
       if (ADDRESS_RE.test(s.address)) return true;
       drop(`token ${s.symbol} ${s.address}`, "not a 20-byte hex address");
       return false;
     });
-    const tokenReplies = await this.rpc.send(
-      seeds.flatMap((s) => [
-        ethCall(s.address, SEL.symbol, [], tag),
-        ethCall(s.address, SEL.decimals, [], tag),
-      ]),
+    const seedPairs: Array<[number, number]> = [];
+    for (let i = 0; i < seeds.length; i++) {
+      for (let j = i + 1; j < seeds.length; j++) seedPairs.push([i, j]);
+    }
+    const first = await this.multicall(
+      [
+        ...seeds.flatMap((s) => [sub(s.address, SEL.symbol), sub(s.address, SEL.decimals)]),
+        ...seedPairs.flatMap(([i, j]) => {
+          const a = encAddress(seeds[i]!.address);
+          const b = encAddress(seeds[j]!.address);
+          return [
+            sub(UNISWAP_V2_FACTORY, SEL.getPair, [a, b]),
+            sub(AERODROME_POOL_FACTORY, SEL.getPool, [a, b, encBool(false)]),
+          ];
+        }),
+      ],
+      tag,
       abort,
     );
 
     const tokens: Token[] = [];
+    const bySeed = new Map<number, Token>();
     seeds.forEach((s, i) => {
       const what = `token ${s.symbol} ${s.address}`;
-      const symHex = definite(tokenReplies[2 * i]!, `${what} symbol()`);
-      const decHex = definite(tokenReplies[2 * i + 1]!, `${what} decimals()`);
+      const symHex = first[2 * i] ?? null;
+      const decHex = first[2 * i + 1] ?? null;
       const symbol = symHex === null ? null : decodeText(symHex);
       const decimals = decHex === null ? null : word(decHex, 0);
       const key = s.address.toLowerCase();
@@ -543,7 +628,9 @@ export class BaseVenue implements Venue {
       } else if (tokens.some((t) => t.key === key)) {
         drop(what, "duplicate of an earlier seed");
       } else {
-        tokens.push({ key, symbol: s.symbol, decimals: s.decimals });
+        const token = { key, symbol: s.symbol, decimals: s.decimals };
+        tokens.push(token);
+        bySeed.set(i, token);
       }
     });
 
@@ -551,30 +638,16 @@ export class BaseVenue implements Venue {
       throw new Error("base: WETH failed verification, so there is no cycle anchor");
     }
 
-    // 3. pool lookup, every unordered pair, both factories
-    const pairs: Array<[Token, Token]> = [];
-    for (let i = 0; i < tokens.length; i++) {
-      for (let j = i + 1; j < tokens.length; j++) pairs.push([tokens[i]!, tokens[j]!]);
-    }
-    const lookups = await this.rpc.send(
-      pairs.flatMap(([a, b]) => [
-        ethCall(UNISWAP_V2_FACTORY, SEL.getPair, [encAddress(a.key), encAddress(b.key)], tag),
-        ethCall(
-          AERODROME_POOL_FACTORY,
-          SEL.getPool,
-          [encAddress(a.key), encAddress(b.key), encBool(false)],
-          tag,
-        ),
-      ]),
-      abort,
-    );
-
     const found: Array<{ dex: Dex; address: string; a: Token; b: Token }> = [];
     let absent = 0;
-    pairs.forEach(([a, b], i) => {
+    const lookupsAt = 2 * seeds.length;
+    seedPairs.forEach(([i, j], p) => {
+      const a = bySeed.get(i);
+      const b = bySeed.get(j);
+      if (!a || !b) return; // a token in this pair failed its check: not a pool of ours
       (["uniswap-v2", "aerodrome"] as const).forEach((dex, k) => {
         const what = `${dex} ${a.symbol}/${b.symbol}`;
-        const hex = definite(lookups[2 * i + k]!, `${what} lookup`);
+        const hex = first[lookupsAt + 2 * p + k] ?? null;
         const address = hex === null ? null : wordAddress(hex, 0);
         if (address === null) drop(what, "factory lookup returned no address");
         else if (address === ZERO_ADDRESS) absent++;
@@ -582,30 +655,38 @@ export class BaseVenue implements Venue {
       });
     });
 
-    // 4. identity of each pool
-    const idReplies = await this.rpc.send(
+    // 3. identity of each pool, plus Aerodrome reserves and fee
+    const second = await this.multicall(
       found.flatMap((f) => [
-        ethCall(f.address, SEL.token0, [], tag),
-        ethCall(f.address, SEL.token1, [], tag),
-        ethCall(f.address, SEL.factory, [], tag),
-        ...(f.dex === "aerodrome" ? [ethCall(f.address, SEL.stable, [], tag)] : []),
+        sub(f.address, SEL.token0),
+        sub(f.address, SEL.token1),
+        sub(f.address, SEL.factory),
+        ...(f.dex === "aerodrome"
+          ? [
+              sub(f.address, SEL.stable),
+              sub(f.address, SEL.getReserves),
+              sub(AERODROME_POOL_FACTORY, SEL.getFee, [encAddress(f.address), encBool(false)]),
+            ]
+          : []),
       ]),
+      tag,
       abort,
     );
 
     const identified: TrackedPool[] = [];
+    const probes: Array<{ pool: TrackedPool; priced: Pool; amountIn: bigint; what: string }> = [];
+    const refused = new Set<string>();
     let at = 0;
     for (const f of found) {
       const what = `${f.dex} ${f.a.symbol}/${f.b.symbol} ${f.address}`;
-      const addr = (r: RpcReply, fn: string): string | null => {
-        const hex = definite(r, `${what} ${fn}`);
-        return hex === null ? null : wordAddress(hex, 0);
-      };
-      const t0 = addr(idReplies[at++]!, "token0()");
-      const t1 = addr(idReplies[at++]!, "token1()");
-      const factory = addr(idReplies[at++]!, "factory()");
-      const stableHex =
-        f.dex === "aerodrome" ? definite(idReplies[at++]!, `${what} stable()`) : null;
+      const addr = (hex: string | null): string | null =>
+        hex === null ? null : wordAddress(hex, 0);
+      const t0 = addr(second[at++] ?? null);
+      const t1 = addr(second[at++] ?? null);
+      const factory = addr(second[at++] ?? null);
+      const stableHex = f.dex === "aerodrome" ? second[at++] ?? null : null;
+      const reservesHex = f.dex === "aerodrome" ? second[at++] ?? null : null;
+      const feeHex = f.dex === "aerodrome" ? second[at++] ?? null : null;
 
       const expectedFactory = (
         f.dex === "aerodrome" ? AERODROME_POOL_FACTORY : UNISWAP_V2_FACTORY
@@ -621,64 +702,46 @@ export class BaseVenue implements Venue {
         drop(what, `factory() is ${factory}, not ${expectedFactory}`);
         continue;
       }
-      if (f.dex === "aerodrome") {
-        const stable = stableHex === null ? null : word(stableHex, 0);
-        if (stable !== 0n) {
-          drop(what, `stable() answered ${stable}, expected false`);
-          continue;
-        }
-      }
       const token0 = t0 === f.a.key ? f.a : f.b;
       const token1 = token0 === f.a ? f.b : f.a;
-      identified.push({ dex: f.dex, address: f.address, token0, token1 });
-    }
+      const pool: TrackedPool = { dex: f.dex, address: f.address, token0, token1 };
 
-    // 5. Aerodrome: our arithmetic against the pool's own quote
-    const aero = identified.filter((p) => p.dex === "aerodrome");
-    const state = await this.rpc.send(
-      aero.flatMap((p) => [
-        ethCall(p.address, SEL.getReserves, [], tag),
-        ethCall(AERODROME_POOL_FACTORY, SEL.getFee, [encAddress(p.address), encBool(false)], tag),
-      ]),
-      abort,
-    );
+      if (f.dex === "uniswap-v2") {
+        identified.push(pool);
+        continue;
+      }
 
-    const probes: Array<{ pool: TrackedPool; priced: Pool; amountIn: bigint; what: string }> = [];
-    const refused = new Set<string>();
-    aero.forEach((p, i) => {
-      const what = `aerodrome ${p.token0.symbol}/${p.token1.symbol} ${p.address}`;
-      const reservesHex = definite(state[2 * i]!, `${what} getReserves()`);
-      const feeHex = definite(state[2 * i + 1]!, `${what} getFee()`);
-      const priced = reservesHex === null ? null : priceFrom(p, reservesHex, feeHex);
-
+      // Aerodrome: not stable, priceable, and probed against its own quote below.
+      const stable = stableHex === null ? null : word(stableHex, 0);
+      if (stable !== 0n) {
+        drop(what, `stable() answered ${stable}, expected false`);
+        continue;
+      }
+      const priced = reservesHex === null ? null : priceFrom(pool, reservesHex, feeHex);
       if (priced === null || "why" in priced) {
         drop(what, priced?.why ?? "getReserves() reverted");
-        refused.add(p.address);
-        return;
+        continue;
       }
       const amountIn = priced.r0 / BigInt(BASE_QUOTE_PROBE_DIVISOR);
       if (amountIn === 0n) {
         drop(what, "reserve0 too small to probe");
-        refused.add(p.address);
-        return;
+        continue;
       }
-      probes.push({ pool: p, priced: priced.pool, amountIn, what });
-    });
+      identified.push(pool);
+      probes.push({ pool, priced: priced.pool, amountIn, what });
+    }
 
-    const quotes = await this.rpc.send(
+    // 4. Aerodrome: our arithmetic against the pool's own quote
+    const quotes = await this.multicall(
       probes.map((q) =>
-        ethCall(
-          q.pool.address,
-          SEL.getAmountOut,
-          [encUint(q.amountIn), encAddress(q.pool.token0.key)],
-          tag,
-        ),
+        sub(q.pool.address, SEL.getAmountOut, [encUint(q.amountIn), encAddress(q.pool.token0.key)]),
       ),
+      tag,
       abort,
     );
 
     probes.forEach((q, i) => {
-      const hex = definite(quotes[i]!, `${q.what} getAmountOut()`);
+      const hex = quotes[i] ?? null;
       const out = hex === null ? null : word(hex, 0);
       if (out === null) {
         drop(q.what, "getAmountOut() reverted");
@@ -712,19 +775,22 @@ export class BaseVenue implements Venue {
     this.verified = true;
   }
 
-  /** One tick's worth of reserves and fees, pinned to a single block. */
+  /**
+   * One tick's worth of reserves and fees, pinned to a single block: one
+   * eth_blockNumber and exactly one eth_call, whatever the number of pools.
+   */
   private async read(abort: AbortSignal): Promise<Pool[]> {
-    this.rpc.resetMode();
     const block = await this.blockNumber(abort);
     const tag = hexTag(block);
 
-    const replies = await this.rpc.send(
+    const replies = await this.multicall(
       this.pools.flatMap((p) => [
-        ethCall(p.address, SEL.getReserves, [], tag),
+        sub(p.address, SEL.getReserves),
         ...(p.dex === "aerodrome"
-          ? [ethCall(AERODROME_POOL_FACTORY, SEL.getFee, [encAddress(p.address), encBool(false)], tag)]
+          ? [sub(AERODROME_POOL_FACTORY, SEL.getFee, [encAddress(p.address), encBool(false)])]
           : []),
       ]),
+      tag,
       abort,
     );
 
@@ -736,8 +802,8 @@ export class BaseVenue implements Venue {
     let aero = 0;
 
     for (const p of this.pools) {
-      const reservesHex = payload(replies[at++]!);
-      const feeHex = p.dex === "aerodrome" ? payload(replies[at++]!) : null;
+      const reservesHex = replies[at++] ?? null;
+      const feeHex = p.dex === "aerodrome" ? replies[at++] ?? null : null;
       if (reservesHex === null || (p.dex === "aerodrome" && feeHex === null)) {
         errors++;
         continue;
@@ -752,7 +818,7 @@ export class BaseVenue implements Venue {
       else uni++;
     }
 
-    this.lastRead = { block, mode: this.rpc.mode, uni, aero, errors, skipped };
+    this.lastRead = { block, uni, aero, errors, skipped };
     return out;
   }
 }

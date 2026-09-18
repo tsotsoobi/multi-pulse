@@ -357,3 +357,57 @@ provisional, sized independently of the XLM/XRP dollar symmetry in section 1, an
 be tuned from collected data. The Uniswap V2 and Aerodrome factory addresses and the
 cbBTC and AERO token addresses were entered unverified; the adapter checks them on-chain
 at startup and drops, by name, anything that does not match.
+
+### 6.1 The public Base endpoint rate-limits eth_call; every read now goes through Multicall3
+
+**The first live run never verified.** Every tick failed at the 6th `eth_call` of
+start-up verification (cbBTC `decimals()`), so no Base pool was ever priced.
+
+**Measured 18 September 2026 against `https://mainnet.base.org`:**
+
+- A batch of 10 `eth_chainId` calls: all 10 succeed.
+- A batch of 10 `eth_blockNumber` calls: all 10 succeed.
+- A batch of 10 `eth_call` (WETH `decimals()`): calls 1 to 5 succeed, 6 to 10 return
+  "over rate limit".
+- Batch A of 5 `eth_call` succeeds; batch B of 5, seconds later, fails entirely; batch C,
+  after a further 2+ seconds, also fails entirely. The allowance came back after about
+  60 s idle.
+
+Conclusion: roughly 5 `eth_call` per time window, the window being somewhere between
+several seconds and 60 s. `eth_chainId` and `eth_blockNumber` are not counted against it.
+A monitor running in parallel shared the allowance during these tests, so the window
+length is approximate.
+
+**The fix: one `eth_call` per tick.** Every contract read is now wrapped in a single call
+to Multicall3 `aggregate3((address,bool,bytes)[])` at
+`0xcA11bde05977b3631167028862bE2a173976CA11` (`MULTICALL3` in `src/config.ts`), with
+`allowFailure` set for every sub-call and the call pinned to the tick's block, as before.
+No other Multicall3 function is used. The calldata is encoded and the result decoded by
+hand in `src/venues/base.ts`, and the RPC allow-list is unchanged.
+
+| | `eth_call`s | not counted |
+|---|---|---|
+| normal tick | exactly 1 | 1 `eth_blockNumber` |
+| `start()` | at most 3 | 1 `eth_chainId`, 1 `eth_blockNumber` |
+| `start()` plus first tick | at most 4 | |
+| tick that must verify first | at most 4 | |
+
+`start()` makes three calls: tokens together with every factory lookup, then pool checks
+together with Aerodrome reserves and fees, then Aerodrome quote checks. `test/check.ts`
+asserts all four figures against a counting fake transport.
+
+**What a failure means now:**
+
+- **A reverted sub-call** (`success = false`) is treated as a revert was before: that
+  token or pool is dropped and named at start-up, or left out of the tick and counted in
+  `call_errors`.
+- **An error on the `eth_call` itself**, "over rate limit" included, is transient. It fails
+  the whole verification or tick, which is retried next time. This is a change for ticks:
+  a failed read used to cost only its own pool, and now a refused `eth_call` fails the
+  tick.
+- **The `rpc=` heartbeat field is gone** along with JSON-RPC batching. No request ever
+  carries more than one call now, so batching had nothing left to do.
+
+**The margin is thin.** `start()` plus the first tick is 4 `eth_call`s against a measured
+allowance of about 5. Anything else on the same IP spending that allowance can still
+cause a refusal. The result is a retried tick, never a wrong price.
