@@ -21,6 +21,15 @@ import {
   parseAmount,
   toPool,
 } from "../src/venues/xrpl.js";
+import {
+  BaseVenue,
+  RPC_METHODS,
+  Rpc,
+  toUnits,
+  type RpcReply,
+  type Transport,
+} from "../src/venues/base.js";
+import { BASE_FEE_NATIVE } from "../src/config.js";
 import type { Pool, Venue } from "../src/venue.js";
 import { readFileSync, readdirSync, rmSync, type Dirent } from "node:fs";
 import { tmpdir } from "node:os";
@@ -848,6 +857,239 @@ const wouldCatch = [...kept.matchAll(/\bcommand\s*:\s*(.{0,40})/g)].filter((m) =
   return !lit || !ALLOWED_COMMANDS.has(lit[1]!);
 });
 check("command check would catch a submit call", wouldCatch.length === 1);
+
+// ---------------------------------------------------------------------------
+// 11. BASE ADAPTER, AND ITS READ-ONLY PROPERTY.
+//
+// Base is read over plain JSON-RPC with no Ethereum library, so the boundary is
+// the same "safe by omission" argument as Stellar plus an explicit method gate
+// like XRPL's command allowlist. Every check here runs offline: the transport
+// is replaced with a fake wherever the venue has to be exercised.
+// ---------------------------------------------------------------------------
+
+const BASE_TS = resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "venues", "base.ts");
+const baseRaw = readFileSync(BASE_TS, "utf8");
+
+/**
+ * Write vocabulary banned from base.ts as plain case-insensitive SUBSTRINGS,
+ * comments included -- stricter than the whole-word scan in section 10.
+ */
+const BASE_BANNED_SUBSTRINGS = [
+  "eth_sendrawtransaction",
+  "eth_sendtransaction",
+  "eth_sign",
+  "personal_sign",
+  "signtypeddata",
+  "privatekey",
+  "mnemonic",
+  "account",
+  "wallet",
+  "sign",
+];
+
+/**
+ * The only exemption: the exact whole-word, case-sensitive tokens `AbortSignal`
+ * and `signal`, which the per-tick deadline needs (fetch's abort option is
+ * spelled `signal`). They are REMOVED from the text before the substring scan,
+ * rather than excused by a lookahead, so a longer name that merely starts with
+ * "sign" -- signAllTransactions, signer, signature -- is still caught.
+ */
+function baseBannedHits(text: string): string[] {
+  const scrubbed = text
+    .replace(/\bAbortSignal\b/g, "")
+    .replace(/\bsignal\b/g, "")
+    .toLowerCase();
+  return BASE_BANNED_SUBSTRINGS.filter((s) => scrubbed.includes(s));
+}
+
+const baseHits = baseBannedHits(baseRaw);
+check("base.ts contains no write vocabulary, even as a substring",
+  baseHits.length === 0, baseHits.join(", "));
+
+// Negative controls: prove the scrub exempts exactly what it says.
+check("scrub still catches a name that starts with signAll",
+  baseBannedHits("await provider.signAllTransactions(txs)").includes("sign"));
+check("scrub does not flag signal on its own",
+  baseBannedHits("fetch(url, { signal: abort }); controller.signal; x: AbortSignal").length === 0);
+check("scrub is case-sensitive: SIGNAL is not the exempt token",
+  baseBannedHits("SIGNAL").includes("sign"));
+
+check("the RPC allow-list is exactly eth_chainId, eth_blockNumber, eth_call",
+  RPC_METHODS.length === 3 &&
+    ["eth_chainId", "eth_blockNumber", "eth_call"].every((m) => RPC_METHODS.includes(m)),
+  RPC_METHODS.join(","));
+
+// Imports: node:* and project-relative paths only. A package import is how a
+// signing library would arrive, and the hashing package already in
+// node_modules (via xrpl) is not an exception -- selectors are hard-coded.
+function nonLocalImports(src: string): string[] {
+  const code = codeOnly(src, true);
+  const specs = [
+    ...[...code.matchAll(/\bfrom\s*["']([^"']+)["']/g)].map((m) => m[1]!),
+    ...[...code.matchAll(/\bimport\s*["']([^"']+)["']/g)].map((m) => m[1]!),
+    ...[...code.matchAll(/\b(?:import|require)\s*\(\s*["']([^"']+)["']/g)].map((m) => m[1]!),
+  ];
+  return specs.filter((s) => !s.startsWith("node:") && !s.startsWith("./") && !s.startsWith("../"));
+}
+const baseImports = nonLocalImports(baseRaw);
+check("base.ts imports only node:* and project-relative modules",
+  baseImports.length === 0, baseImports.join(", "));
+const importProbeBase = nonLocalImports([
+  'import { keccak_256 } from "@noble/hashes/sha3.js";',
+  'import { createPublicClient } from "viem";',
+  'const e = await import("ethers");',
+  'import type { Pool } from "../venue.js";',
+  'import { readFileSync } from "node:fs";',
+].join("\n"));
+check("the import check catches packages and passes local and node: imports",
+  importProbeBase.length === 3 && importProbeBase.includes("@noble/hashes/sha3.js"),
+  importProbeBase.join(", "));
+
+// Every JSON-RPC method name written as code anywhere under src/ or scripts/
+// must be on the allow-list. Comments are stripped; strings are kept, because
+// the method name IS a string.
+const RPC_NAME = /\b(eth_\w+|personal_\w+)\b/g;
+const rpcNameViolations: string[] = [];
+for (const { path, raw } of sources) {
+  for (const m of codeOnly(raw, true).matchAll(RPC_NAME)) {
+    if (!RPC_METHODS.includes(m[1]!)) rpcNameViolations.push(`${path}: ${m[1]}`);
+  }
+}
+check("every JSON-RPC method named in code is on the allow-list",
+  rpcNameViolations.length === 0, rpcNameViolations.join(" | "));
+const rpcProbe = [...codeOnly(
+  '// eth_sendRawTransaction in a comment is fine\nrpc.send([{ method: "eth_sendRawTransaction", params: [] }]);',
+  true,
+).matchAll(RPC_NAME)].filter((m) => !RPC_METHODS.includes(m[1]!));
+check("method-name check would catch eth_sendRawTransaction in code", rpcProbe.length === 1);
+
+// No Ethereum library as a dependency.
+const pkg = JSON.parse(
+  readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
+) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+const allDeps = [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.devDependencies ?? {})];
+check("runtime dependencies are exactly xrpl",
+  Object.keys(pkg.dependencies ?? {}).join(",") === "xrpl",
+  Object.keys(pkg.dependencies ?? {}).join(","));
+check("no Ethereum library in package.json",
+  !allDeps.some((d) => /^(viem|ethers|web3|ox|@ethersproject\/.*|web3-.*)$/.test(d)),
+  allDeps.join(","));
+
+// The gate refuses before anything is sent -- including the good calls that
+// share a request with the bad one.
+let gateSent = 0;
+const recording: Transport = async () => {
+  gateSent++;
+  return { status: 200, json: [] };
+};
+let gateThrew = false;
+try {
+  await new Rpc(recording).send(
+    [{ method: "eth_blockNumber", params: [] }, { method: "eth_sendRawTransaction", params: ["0x00"] }],
+    new AbortController().signal,
+  );
+} catch {
+  gateThrew = true;
+}
+check("the RPC gate throws on a method off the allow-list", gateThrew);
+check("and nothing at all reached the transport", gateSent === 0, `sent=${gateSent}`);
+
+// Batch mode: replies are matched by id, not by position.
+const shuffling: Transport = async (body) => {
+  const req = JSON.parse(body) as Array<{ id: number; method: string }>;
+  return {
+    status: 200,
+    json: [...req].reverse().map((r) => ({ jsonrpc: "2.0", id: r.id, result: r.method })),
+  };
+};
+const batchRpc = new Rpc(shuffling);
+const batchReplies: RpcReply[] = await batchRpc.send(
+  [{ method: "eth_chainId", params: [] }, { method: "eth_blockNumber", params: [] }],
+  new AbortController().signal,
+);
+check("a batch reply is matched back to request order by id",
+  batchRpc.mode === "batch" &&
+    batchReplies.map((r) => (r.ok ? r.result : "ERR")).join(",") === "eth_chainId,eth_blockNumber",
+  JSON.stringify(batchReplies));
+
+// Sequential fallback when the endpoint refuses batches.
+const seen: string[] = [];
+const noBatches: Transport = async (body) => {
+  const req = JSON.parse(body) as { id: number; method: string } | unknown[];
+  if (Array.isArray(req)) {
+    seen.push("batch");
+    return { status: 400, json: { error: { code: -32600, message: "batch not supported" } } };
+  }
+  seen.push(req.method);
+  return { status: 200, json: { jsonrpc: "2.0", id: req.id, result: "0x10" } };
+};
+const seqRpc = new Rpc(noBatches);
+const seqReplies = await seqRpc.send(
+  [{ method: "eth_blockNumber", params: [] }, { method: "eth_chainId", params: [] }],
+  new AbortController().signal,
+);
+check("a refused batch falls back to sequential calls",
+  seqRpc.mode === "sequential" &&
+    seen.join(",") === "batch,eth_blockNumber,eth_chainId" &&
+    seqReplies.every((r) => r.ok && r.result === "0x10"),
+  `${seqRpc.mode} ${seen.join(",")}`);
+
+// The whole tick is under a hard deadline, including a transport that never
+// answers at all.
+const hanging: Transport = () => new Promise(() => {});
+let timeoutMessage = "";
+const tStart = Date.now();
+try {
+  await new BaseVenue({ transport: hanging, tickTimeoutMs: 50 }).fetchPools();
+} catch (e: any) {
+  timeoutMessage = e?.message ?? String(e);
+}
+check("a hung Base tick rejects at its deadline",
+  /tick exceeded 50 ms/.test(timeoutMessage) && Date.now() - tStart < 2_000,
+  timeoutMessage);
+
+// Arithmetic: constant product with a non-30 bp fee, from both directions.
+const bv = new BaseVenue({ transport: hanging });
+const WETH_KEY = "0x4200000000000000000000000000000000000006";
+const USDC_KEY = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const bp = (feeBp: number): Pool => ({ id: "0xpool", a: WETH_KEY, b: USDC_KEY, ra: 100, rb: 300_000, feeBp });
+const expected = (amt: number, rIn: number, rOut: number, fee: number) => {
+  const net = amt * (1 - fee / 10_000);
+  return (net * rOut) / (rIn + net);
+};
+check("base simulate: 5 bp fee, WETH in",
+  Math.abs(bv.simulate(bp(5), WETH_KEY, 1) - expected(1, 100, 300_000, 5)) < 1e-9,
+  String(bv.simulate(bp(5), WETH_KEY, 1)));
+check("base simulate: 100 bp fee, USDC in",
+  Math.abs(bv.simulate(bp(100), USDC_KEY, 3_000) - expected(3_000, 300_000, 100, 100)) < 1e-12,
+  String(bv.simulate(bp(100), USDC_KEY, 3_000)));
+check("base simulate: a lower fee gives more out",
+  bv.simulate(bp(5), WETH_KEY, 1) > bv.simulate(bp(30), WETH_KEY, 1));
+check("base native key is WETH and fee is BASE_FEE_NATIVE",
+  bv.nativeKey === WETH_KEY && bv.feeNative === BASE_FEE_NATIVE);
+
+// Reserve conversion at 18 (WETH) and 6 (USDC) decimals.
+check("toUnits: 1e18 raw at 18 decimals is 1 WETH", toUnits(10n ** 18n, 18) === 1);
+check("toUnits: 1.5 WETH", toUnits(1_500_000_000_000_000_000n, 18) === 1.5);
+check("toUnits: 1,500,000 raw at 6 decimals is 1.5 USDC", toUnits(1_500_000n, 6) === 1.5);
+check("toUnits: 123,456,789 raw at 6 decimals",
+  Math.abs(toUnits(123_456_789n, 6) - 123.456789) < 1e-12,
+  String(toUnits(123_456_789n, 6)));
+check("toUnits: a large 18-decimal reserve keeps its precision",
+  Math.abs(toUnits(123_456_789_123_456_789_123_456_789n, 18) - 123_456_789.123456789) < 1e-6,
+  String(toUnits(123_456_789_123_456_789_123_456_789n, 18)));
+check("toUnits: 0 decimals is the raw integer", toUnits(42n, 0) === 42);
+
+// Sizing: the Base venue is searched with its own ladder.
+const B = VENUE_LIMITS.base;
+check("limitsFor(base) carries the base ladder",
+  limitsFor("base").sizeLadder === B.sizeLadder && limitsFor("base").maxSize === B.maxTradeSize);
+check("base depth floor is 10x its top rung", B.minPoolNative === 10 * B.maxTradeSize,
+  `floor=${B.minPoolNative} top=${B.maxTradeSize}`);
+const baseSizes = ladderProbe(bv, WETH_KEY);
+check("base sizes come off the base ladder",
+  baseSizes.length > 0 && baseSizes.every((s) => B.sizeLadder.includes(s)),
+  baseSizes.join(","));
 
 console.log(fail === 0 ? "\nall checks passed" : `\n${fail} FAILED`);
 process.exit(fail === 0 ? 0 : 1);

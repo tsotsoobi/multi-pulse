@@ -20,6 +20,7 @@ import {
 } from "./logger.js";
 import { StellarVenue } from "./venues/stellar.js";
 import { XrplVenue } from "./venues/xrpl.js";
+import { BaseVenue } from "./venues/base.js";
 import type { Venue } from "./venue.js";
 
 /**
@@ -43,6 +44,8 @@ function buildVenue(name: VenueName): Venue {
       return new StellarVenue();
     case "xrpl":
       return new XrplVenue();
+    case "base":
+      return new BaseVenue();
   }
 }
 

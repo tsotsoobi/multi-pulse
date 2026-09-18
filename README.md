@@ -1,8 +1,8 @@
 # multi-pulse
 
-A read-only AMM observer for two mainnets: Stellar and XRPL.
+A read-only AMM observer for three mainnets: Stellar, XRPL and Base.
 
-It walks live automated market maker pools on both chains, prices a ladder of trade
+It walks live automated market maker pools on each chain, prices a ladder of trade
 sizes against exact constant product maths, and records any round trip that would clear
 a net profit threshold after an assumed fee. It records them. It does not take them.
 
@@ -11,10 +11,10 @@ Results from an actual 28-hour run are in [FINDINGS.md](FINDINGS.md).
 ## What it deliberately does not do
 
 This is the important part, so it goes first, and it is worth stating precisely because
-the honest answer differs between the two venues.
+the honest answer differs between the venues.
 
 **multi-pulse does not sign transactions and does not send them.** No code path in this
-repository builds, signs, or submits anything to either chain.
+repository builds, signs, or submits anything to any of the three chains.
 
 **On Stellar the guarantee is structural.** `@stellar/stellar-sdk` is not a dependency.
 It is not in `package.json` and it is not on disk, so `Keypair`, `TransactionBuilder`
@@ -35,6 +35,17 @@ The claim is that nothing imports them and nothing calls them:
   All five are ledger reads. `submit` is a rippled command name reachable through the
   same `Client.request()` this code does use, so the command literals are constrained
   as tightly as the imports.
+
+**On Base the guarantee is structural, as on Stellar, plus an explicit gate.** No
+Ethereum library is a dependency: not viem, not ethers, not web3, and the adapter imports
+no package at all, only `node:` built-ins and project files. Function selectors are
+hard-coded and ABI data is decoded by hand, so nothing able to build, sign or send a
+transaction is on the Base adapter's path. Every request goes through one function that
+sends only `eth_chainId`, `eth_blockNumber` and `eth_call`, all reads, and throws before
+anything leaves the process if asked for any other method. `npm run check` pins that
+allow-list, fails on any package import in `src/venues/base.ts`, and fails if that file
+contains write vocabulary such as `sign`, `wallet`, `account` or
+`eth_sendRawTransaction`, even as a substring.
 
 **The venue interface has no execution surface.** A `Venue` exposes exactly `name`,
 `nativeKey`, `feeNative`, `fetchPools()`, `simulate()` and `assetLabel()`. There is no
@@ -117,6 +128,17 @@ tokens that are not both on it is not merely mispriced, it is invisible, and so 
 cycle with a leg in it. Read a quiet XRPL tick as "quiet among these tokens", never as
 "quiet".
 
+**Base mainnet** (chain id 8453), via `https://mainnet.base.org` over plain JSON-RPC.
+Uniswap V2 pairs and Aerodrome volatile pools only, both constant product; Aerodrome
+stable pools, Uniswap v3 and concentrated-liquidity pools are out of scope. Like XRPL it
+works from a seed list: four tokens (WETH, USDC, cbBTC, AERO), and every pair of them is
+looked up in both factories. At startup it confirms the chain id, each token's `symbol()`
+and `decimals()`, each pool's `token0`/`token1` and factory, and that each Aerodrome
+pool's own `getAmountOut` quote agrees with this program's arithmetic to 0.01%. Anything
+that fails is dropped and counted. Each tick reads every reserve and every Aerodrome fee
+pinned to one block, batched where the endpoint allows it, under a 15-second deadline.
+Read a quiet Base tick as "quiet among these four tokens".
+
 ## How detection works
 
 Two route shapes, both cycles that start and end in the venue's native asset:
@@ -164,7 +186,7 @@ rather than a rich opportunity.
 
 ```bash
 npm install
-npm run monitor        # continuous read loop across both venues
+npm run monitor        # continuous read loop across all enabled venues
 npm run seeds          # rebuild the XRPL seed token list from a ledger walk
 npm run verify-seeds   # check the committed seed list against the ledger
 npm run check          # test suite, including the read-only assertions above
@@ -178,15 +200,15 @@ The only runtime dependency is `xrpl`. The project is ESM and runs through `tsx`
 All of it lives in `src/config.ts` as checked-in constants, each with its reasoning
 recorded alongside it. The values that shape the output most:
 
-| Setting | Stellar | XRPL |
-| --- | --- | --- |
-| Endpoint | `https://horizon.stellar.org` | `wss://s2.ripple.com` |
-| Size ladder, 11 rungs | 1 to 1,000 XLM | 0.1 to 100 XRP |
-| `minPoolNative`, depth floor | 10,000 XLM | 1,000 XRP |
-| `minNetProfit`, absolute floor | 0.01 XLM | 0.001 XRP |
-| `minProfitBps`, net, shared | 20 | 20 |
-| Assumed flat round-trip fee | 0.001 XLM | 0.0001 XRP |
-| Request timeout | 15,000 ms | 15,000 ms |
+| Setting | Stellar | XRPL | Base |
+| --- | --- | --- | --- |
+| Endpoint | `https://horizon.stellar.org` | `wss://s2.ripple.com` | `https://mainnet.base.org` |
+| Size ladder | 1 to 1,000 XLM, 11 rungs | 0.1 to 100 XRP, 11 rungs | 0.01 to 0.5 ETH, 5 rungs (provisional) |
+| `minPoolNative`, depth floor | 10,000 XLM | 1,000 XRP | 5 ETH |
+| `minNetProfit`, absolute floor | 0.01 XLM | 0.001 XRP | 0.000001 ETH |
+| `minProfitBps`, net, shared | 20 | 20 | 20 |
+| Assumed flat round-trip fee | 0.001 XLM | 0.0001 XRP | 0.00005 ETH |
+| Timeout | 15,000 ms per request | 15,000 ms per request | 15,000 ms per whole tick |
 
 `POLL_MS` is 60,000 and bounds every venue's sampling interval. Ladders and floors are
 split per venue because a size is meaningless without the asset it is denominated in;
@@ -211,6 +233,10 @@ every tick whether or not anything was found, so a quiet market and a stalled pr
 distinguishable from the CSV alone; without it the two produce byte-identical files. An
 `error` row is a heartbeat whose tick failed, kept separate because a gap caused by an
 endpoint returning 503 is not evidence about the market.
+
+`size`, `output`, `fee_native` and `net_profit` are in the row's own venue's native asset:
+XLM for `stellar`, XRP for `xrpl`, ETH for `base`. They must not be summed or compared
+across venues without converting them first.
 
 ## Findings
 

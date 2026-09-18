@@ -319,3 +319,41 @@ Why this does not explain the zero:
 What blindness does bound is persistence: this run cannot see an edge that opened and
 closed inside one of those gaps. The claim that survives is about the 1,310 sampled
 instants, not the continuous interval.
+
+## 6. 18 September 2026: Base added to the shared loop
+
+A third venue, Base mainnet (chain id 8453), was added and enabled in `ENABLED_VENUES`
+alongside Stellar and XRPL. It is read over plain JSON-RPC (`eth_chainId`,
+`eth_blockNumber`, `eth_call` only) with no Ethereum library, and watches Uniswap V2
+pairs and Aerodrome volatile pools among four seed tokens. Nothing in sections 1 to 5
+includes Base; no Base data had been collected when this entry was written.
+
+What changes for the existing venues, and what does not:
+
+- **Their code, constants and limits are unchanged.** Stellar and XRPL are searched with
+  exactly the ladders, floors and fees in section 1.
+- **They now share the loop with Base.** Venues are polled one after another in a single
+  loop, so every iteration now includes Base's fetch. `tick_interval_ms` stays at about
+  `POLL_MS` (60,000 ms) unless Stellar, XRPL and Base together take longer than that.
+  Tick durations were last measured in the two-venue run of 11 August 2026
+  (`data/monitor.log`, `tick_ms` field; `data/` is gitignored, so the log is not
+  committed): Stellar median 9.3 s, range 7.1 to 32.4 s; XRPL median 4.1 s, typically
+  3.6 to 4.2 s after warm-up, with warm-up ticks up to 11.6 s and two mid-run ticks of
+  96 s and 146 s that logged probe errors. Base's tick is hard-capped at 15,000 ms
+  (`BASE_TICK_TIMEOUT_MS`). At the medians the three fit inside `POLL_MS`; the XRPL
+  maximum alone already exceeded it before Base was added, so an occasional long
+  `tick_interval_ms` is not by itself evidence against Base. No run with all three
+  venues has been timed yet; `tick_interval_ms` and `tick_ms` will show it.
+- **Startup can take up to 15 s longer**, because Base's `start()` verifies its chain id,
+  tokens and pools before the loop begins, under the same 15-second deadline.
+
+**`net_profit` is in each venue's own native asset:** XLM on `stellar` rows, XRP on
+`xrpl` rows, ETH on `base` rows. The same is true of `size`, `output` and `fee_native`.
+These columns must not be summed or compared across venues without first converting them
+at a stated rate. A CSV that now mixes three units in one column is easy to misread.
+
+The Base ladder (0.01 to 0.5 ETH), floors and the 0.00005 ETH fee assumption are
+provisional, sized independently of the XLM/XRP dollar symmetry in section 1, and are to
+be tuned from collected data. The Uniswap V2 and Aerodrome factory addresses and the
+cbBTC and AERO token addresses were entered unverified; the adapter checks them on-chain
+at startup and drops, by name, anything that does not match.

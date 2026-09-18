@@ -15,18 +15,22 @@
  */
 
 /** Every venue this repo knows how to build. */
-export type VenueName = "stellar" | "xrpl";
+export type VenueName = "stellar" | "xrpl" | "base";
 
 /**
- * Which venues the monitor drives. Run one, or both.
+ * Which venues the monitor drives. Run any subset.
  *
  * Venues are polled sequentially and their results never mix: opportunities are
  * cycles within a single venue, streaks are tracked per venue, and the CSV
- * carries a `venue` column. Enabling both does not look for cross-chain routes
- * and could not -- there is no bridge in this program and nothing to bridge
- * with.
+ * carries a `venue` column. Enabling several does not look for cross-chain
+ * routes and could not -- there is no bridge in this program and nothing to
+ * bridge with.
+ *
+ * All venues share one loop, so every venue's tick is part of every other
+ * venue's iteration. The interval stays at POLL_MS only while the ticks
+ * together fit inside it; Base's is capped at BASE_TICK_TIMEOUT_MS.
  */
-export const ENABLED_VENUES: readonly VenueName[] = ["stellar", "xrpl"];
+export const ENABLED_VENUES: readonly VenueName[] = ["stellar", "xrpl", "base"];
 
 /** Horizon base URL. Read-only REST; only GET requests are ever issued. */
 export const HORIZON_URL = "https://horizon.stellar.org";
@@ -50,10 +54,12 @@ export const HORIZON_URL = "https://horizon.stellar.org";
  *
  * 60000 puts the walk back to roughly the rate that was demonstrably accepted
  * while KEEPING the part of the parallel walk that actually mattered: a
- * snapshot assembled in ~7s instead of ~61s. Resolution returns to about what
- * it was; internal consistency of each snapshot is 8x better and stays that
- * way. Those two are independent, and it was the second one that was a
- * correctness problem rather than a comfort.
+ * snapshot assembled in ~7s (as measured when the sharded walk was
+ * introduced, commit 99e8ab8; the 11 August 2026 run measured a 9.3 s median)
+ * instead of ~61s. Resolution returns to about what it was; internal
+ * consistency of each snapshot is 8x better and stays that way. Those two are
+ * independent, and it was the second one that was a correctness problem rather
+ * than a comfort.
  *
  * RAISING RESOLUTION FROM HERE COSTS REQUESTS, and there is no way around that
  * while the venue must enumerate 39,000 pools to see any of them. Halving this
@@ -352,6 +358,21 @@ export const VENUE_LIMITS: Record<VenueName, VenueLimits> = {
     minProfitBps: MIN_PROFIT_BPS,
     // ~$3,000 at 10:1, and 10x the 100 XRP top rung. See MIN_POOL_NATIVE_NOTE.
     minPoolNative: 1_000,
+  },
+  // PROVISIONAL, all in ETH. These are starting values to be tuned from
+  // collected data, not a dollar match for the two ladders above: no XLM/ETH or
+  // XRP/ETH ratio has been measured, and the network fee on this venue is far
+  // larger in dollar terms (see BASE_FEE_NATIVE), so the bottom rungs will
+  // rarely clear. Retune between runs, never mid-run.
+  base: {
+    sizeLadder: [0.01, 0.05, 0.1, 0.25, 0.5],
+    maxTradeSize: 0.5,
+    // 0.000001 ETH ~ $0.003 at an assumed ~$3,000/ETH, in the style of the
+    // floors above. BASE_FEE_NATIVE dominates it at every rung.
+    minNetProfit: 0.000001,
+    minProfitBps: MIN_PROFIT_BPS,
+    // 10x the 0.5 ETH top rung. See MIN_POOL_NATIVE_NOTE.
+    minPoolNative: 5,
   },
 };
 
@@ -810,5 +831,127 @@ export const XRPL_SEED_TOKENS: readonly SeedToken[] = [
     currency: "424F464C00000000000000000000000000000000",
     issuer: "rGYZ4rUwVAsKa2oThX62pC9fiw8kZBmtyi",
     note: "BOFL (hex-encoded) -- 604 XRP",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Base mainnet (Ethereum L2, chain id 8453)
+// ---------------------------------------------------------------------------
+
+/**
+ * Public Base mainnet JSON-RPC endpoint.
+ *
+ * Read-only is enforced by method vocabulary, as on XRPL: BaseVenue sends only
+ * eth_chainId, eth_blockNumber and eth_call, through one gate that throws on
+ * anything else, and test/check.ts asserts the allow-list and scans the source.
+ * A checked-in constant like every other endpoint here, so each run is
+ * attributable to one stated node. No API key, and none may be added: a keyed
+ * provider would be the first process.env read in this repo.
+ */
+export const BASE_RPC_URL = "https://mainnet.base.org";
+
+/** eth_chainId must answer this (0x2105) or the venue refuses to run. */
+export const BASE_CHAIN_ID = 8453;
+
+/**
+ * Flat round-trip cost assumed for one Base cycle, in ETH.
+ *
+ * Deliberately an overestimate, erring the same way as
+ * STELLAR_BASE_FEE_STROOPS and XRPL_FEE_SAFETY_MULTIPLIER:
+ *
+ *   gas       a worst-case cycle is three separate swaps at ~130k gas each,
+ *             ~390k, rounded to 400k, priced at 0.1 gwei -- well above typical
+ *             Base execution prices -- is 0.00004 ETH.
+ *   L1 data   the blob-era data fee for a swap is normally far below 1e-6 ETH;
+ *             0.00001 ETH of headroom is added for it.
+ *
+ * Total 0.00005 ETH. It cannot match the other venues in dollars (~$0.15 at an
+ * assumed $3,000/ETH against ~$0.0003) because Base gas really is dearer; what
+ * is kept is the direction of the error. It is 50 bps of the 0.01 ETH bottom
+ * rung, so the bottom of the ladder will rarely clear.
+ *
+ * Not measured: eth_gasPrice is outside the RPC allow-list. The L1 part could
+ * later be read through eth_call to the GasPriceOracle predeploy.
+ */
+export const BASE_FEE_NATIVE = 0.00005;
+
+/**
+ * Hard deadline on one Base tick, and separately on start(), in ms. When it
+ * passes every in-flight request is aborted and the tick throws, which
+ * monitor.ts records as an error row.
+ */
+export const BASE_TICK_TIMEOUT_MS = 15_000;
+
+/** Calls per JSON-RPC batch. A normal tick needs at most 19. */
+export const BASE_BATCH_MAX = 20;
+
+/**
+ * Largest relative gap allowed at startup between our simulate() and an
+ * Aerodrome pool's own getAmountOut quote: 0.01%. A pool outside it is dropped.
+ */
+export const BASE_QUOTE_TOLERANCE = 0.0001;
+
+/** The startup quote check swaps reserve0 / this, in raw units of token0. */
+export const BASE_QUOTE_PROBE_DIVISOR = 10_000;
+
+/**
+ * Below this many raw output units, integer rounding alone can exceed
+ * BASE_QUOTE_TOLERANCE, so the check cannot resolve and the pool is dropped.
+ */
+export const BASE_QUOTE_MIN_OUT_RAW = 1_000_000;
+
+/** Uniswap V2 pairs charge a fixed 30 bp, in the pair code itself (997/1000). */
+export const UNISWAP_V2_FEE_BP = 30;
+
+/** Uniswap V2 factory on Base. UNVERIFIED: owner to check on basescan. */
+export const UNISWAP_V2_FACTORY = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6";
+
+/** Aerodrome PoolFactory on Base. UNVERIFIED: owner to check on basescan. */
+export const AERODROME_POOL_FACTORY = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
+
+/** One seeded ERC-20, with what start() expects symbol() and decimals() to say. */
+export interface BaseSeedToken {
+  symbol: string;
+  address: string;
+  decimals: number;
+  /** Free-text provenance. Display and review only; never parsed. */
+  note?: string;
+}
+
+/**
+ * Tokens BaseVenue looks up pools between. No pair walking: every unordered
+ * pair of these is asked of the Uniswap V2 factory (getPair) and the Aerodrome
+ * factory (getPool, volatile only), which yields WETH pools for direct cycles
+ * and token-to-token pools for triangular ones.
+ *
+ * As on XRPL, the venue sees exactly the pools among these tokens and no
+ * others. Read a quiet Base tick as "quiet among these four tokens".
+ *
+ * symbol and decimals are expectations, checked on-chain in start(); a token
+ * that disagrees is dropped and counted, never trusted.
+ */
+export const BASE_SEED_TOKENS: readonly BaseSeedToken[] = [
+  {
+    symbol: "WETH",
+    address: "0x4200000000000000000000000000000000000006",
+    decimals: 18,
+    note: "native side, predeploy",
+  },
+  {
+    symbol: "USDC",
+    address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    decimals: 6,
+  },
+  {
+    symbol: "cbBTC",
+    address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+    decimals: 8,
+    note: "UNVERIFIED: owner to check on basescan",
+  },
+  {
+    symbol: "AERO",
+    address: "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
+    decimals: 18,
+    note: "UNVERIFIED: owner to check on basescan",
   },
 ];
