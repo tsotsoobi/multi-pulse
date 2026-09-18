@@ -411,3 +411,58 @@ asserts all four figures against a counting fake transport.
 **The margin is thin.** `start()` plus the first tick is 4 `eth_call`s against a measured
 allowance of about 5. Anything else on the same IP spending that allowance can still
 cause a refusal. The result is a retried tick, never a wrong price.
+
+### 6.2 First verified run: three Aerodrome pools dropped by a quote threshold set too high
+
+**The first verified live run (18 September 2026)** reported tokens 4/4, uni=5, aero=3,
+absent=1, dropped=3, with Base `tick_ms` from 716 to 3265. The counts add up: 6 token
+pairs in 2 factories is 12 lookups, which found 5 Uniswap V2 pairs and 6 Aerodrome pools,
+with 1 absent. Three of the Aerodrome pools were dropped by the start-up quote check:
+
+```
+aerodrome WETH/cbBTC 0x2578365b3dfa7ffe60108e181efb79feddec2319: quote of 56314 raw units cannot resolve 0.01%
+aerodrome USDC/cbBTC 0x9c38b55f9a9aba91bbcedeb12bf4428f47a6a0b8: quote of 12359 raw units cannot resolve 0.01%
+aerodrome cbBTC/AERO 0x1244264aec147f26b056d00d265eea0bc46db83c: quote of 74 raw units cannot resolve 0.01%
+```
+
+All three quotes are in cbBTC, which has 8 decimals, because cbBTC's address sorts above
+the other three tokens and so is token1 in every pool, the side the probe buys. The pool
+labels in these messages are in seed-list order, not token0/token1 order. They appear only
+in drop messages and never reach `route_key`, `route_label`, pool ids, deduplication or
+streaks.
+
+**Diagnosis.** The check refused any quote below a hard-coded `BASE_QUOTE_MIN_OUT_RAW` of
+1,000,000 raw units. Nothing derived that figure, and it hit hardest where the output token
+has few decimals. Aerodrome's volatile `getAmountOut` has exactly two integer floors: the
+fee deduction, which leaves the net input up to 1 raw unit high, and the constant-product
+division, which leaves the output up to 1 raw unit low. Against our exact `simulate()`,
+they move the answer by under `1/amountIn` and `1/out` respectively. `simulate()`'s own
+floating-point error is around 1e-15 relative and negligible.
+
+**Fix.**
+
+- **The threshold is derived:** `BASE_QUOTE_MIN_RAW = quoteMinRaw(BASE_QUOTE_TOLERANCE)`,
+  which is 2 floors times a margin of 2, divided by the tolerance: 40,000 raw units at
+  0.01%. The two floors' worst cases are added, although their signs are opposite in
+  practice. The margin of 2 means rounding can use at most half the tolerance, leaving the
+  rest for a real disagreement in formula or fee. The old 1,000,000 was 25x stricter.
+- **It applies to the probe input too**, after the pool's fee is deducted. The input floor
+  is relative to the input, and when a raw unit of the input token is worth many raw units
+  of the output token, a bound on the output alone is not enough.
+- **The probe is 0.1% of reserveIn** (`BASE_QUOTE_PROBE_DIVISOR` 1,000, was 10,000). At
+  0.01% the constant-product curvature was about the size of the tolerance, so a quote that
+  ignored price impact would nearly have passed. At 0.1% it is ten times the tolerance.
+  0.1% of a reserve is still nowhere near draining the pool.
+
+**Expected effect on the three pools**, estimated because reserves will have moved since the
+logged run. A 10x larger probe scales the output by about 9.991.
+
+| Pool | Logged quote (1/10,000) | Estimated quote (1/1,000) | Against 40,000 |
+|---|---|---|---|
+| WETH/cbBTC | 56,314 | about 562,600 | passes |
+| USDC/cbBTC | 12,359 | about 123,500 | passes |
+| cbBTC/AERO | 74 | about 740 | still dropped |
+
+cbBTC/AERO holds roughly 0.0074 cbBTC and would need a probe of about 1/18 of its reserve
+to resolve 0.01%. It stays dropped, which is also the right outcome for a pool that small.
+The next run will confirm or correct these estimates.

@@ -2,7 +2,7 @@ import {
   AERODROME_POOL_FACTORY,
   BASE_CHAIN_ID,
   BASE_FEE_NATIVE,
-  BASE_QUOTE_MIN_OUT_RAW,
+  BASE_QUOTE_MIN_RAW,
   BASE_QUOTE_PROBE_DIVISOR,
   BASE_QUOTE_TOLERANCE,
   BASE_RPC_URL,
@@ -722,9 +722,15 @@ export class BaseVenue implements Venue {
         drop(what, priced?.why ?? "getReserves() reverted");
         continue;
       }
+      // Both rounding bounds must hold: on the input after the pool's own fee
+      // deduction, and on the output below. See BASE_QUOTE_MIN_RAW.
       const amountIn = priced.r0 / BigInt(BASE_QUOTE_PROBE_DIVISOR);
-      if (amountIn === 0n) {
-        drop(what, "reserve0 too small to probe");
+      const netIn = amountIn - (amountIn * BigInt(priced.pool.feeBp)) / 10_000n;
+      if (netIn < BigInt(BASE_QUOTE_MIN_RAW)) {
+        drop(
+          what,
+          `probe of ${netIn} raw units after fee cannot resolve ${BASE_QUOTE_TOLERANCE * 100}%`,
+        );
         continue;
       }
       identified.push(pool);
@@ -748,7 +754,7 @@ export class BaseVenue implements Venue {
         refused.add(q.pool.address);
         return;
       }
-      if (out < BigInt(BASE_QUOTE_MIN_OUT_RAW)) {
+      if (out < BigInt(BASE_QUOTE_MIN_RAW)) {
         drop(q.what, `quote of ${out} raw units cannot resolve ${BASE_QUOTE_TOLERANCE * 100}%`);
         refused.add(q.pool.address);
         return;

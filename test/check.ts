@@ -34,8 +34,12 @@ import {
 import {
   AERODROME_POOL_FACTORY,
   BASE_FEE_NATIVE,
+  BASE_QUOTE_MIN_RAW,
+  BASE_QUOTE_PROBE_DIVISOR,
+  BASE_QUOTE_TOLERANCE,
   MULTICALL3,
   UNISWAP_V2_FACTORY,
+  quoteMinRaw,
 } from "../src/config.js";
 import type { Pool, Venue } from "../src/venue.js";
 import { readFileSync, readdirSync, rmSync, type Dirent } from "node:fs";
@@ -1199,7 +1203,8 @@ const FAKE_TOKENS: Record<string, { symbol: string; decimals: number }> = {
   [CBBTC_KEY]: { symbol: "cbBTC", decimals: 8 },
   [AERO_KEY]: { symbol: "AERO", decimals: 18 },
 };
-const FAKE_POOLS: Record<string, { aero: boolean; t0: string; t1: string; r0: bigint; r1: bigint }> = {
+type FakePools = Record<string, { aero: boolean; t0: string; t1: string; r0: bigint; r1: bigint }>;
+const FAKE_POOLS: FakePools = {
   [POOL_UNI]: { aero: false, t0: WETH_KEY, t1: USDC_KEY, r0: 1_000n * 10n ** 18n, r1: 3_000_000n * 10n ** 6n },
   [POOL_AERO_1]: { aero: true, t0: WETH_KEY, t1: USDC_KEY, r0: 500n * 10n ** 18n, r1: 1_500_000n * 10n ** 6n },
   [POOL_AERO_2]: { aero: true, t0: USDC_KEY, t1: AERO_KEY, r0: 1_000_000n * 10n ** 6n, r1: 2_000_000n * 10n ** 18n },
@@ -1247,7 +1252,7 @@ function writeResults(results: Array<string | null>): string {
   return "0x" + w("20") + w(results.length.toString(16)) + heads.join("") + tails.join("");
 }
 
-function fakeAnswer(s: FakeSub, reverts: Set<string>): string | null {
+function fakeAnswer(s: FakeSub, reverts: Set<string>, pools: FakePools): string | null {
   const target = s.target.toLowerCase();
   const sel = s.data.slice(0, 8);
   const args = s.data.slice(8);
@@ -1264,7 +1269,7 @@ function fakeAnswer(s: FakeSub, reverts: Set<string>): string | null {
 
   const lookup = (aero: boolean): string => {
     const [a, b] = [argAddr(0), argAddr(1)];
-    const hit = Object.entries(FAKE_POOLS).find(([, p]) =>
+    const hit = Object.entries(pools).find(([, p]) =>
       p.aero === aero && ((p.t0 === a && p.t1 === b) || (p.t0 === b && p.t1 === a)),
     );
     return wa(hit ? hit[0] : "0x" + "0".repeat(40));
@@ -1273,7 +1278,7 @@ function fakeAnswer(s: FakeSub, reverts: Set<string>): string | null {
   if (target === AERO_F && sel === "79bc57d5") return argUint(2) === 0n ? lookup(true) : wa("0x" + "0".repeat(40));
   if (target === AERO_F && sel === "cc56b2c5") return w(FAKE_FEE_BP.toString(16));
 
-  const pool = FAKE_POOLS[target];
+  const pool = pools[target];
   if (!pool) return null;
   if (sel === "0dfe1681") return wa(pool.t0);
   if (sel === "d21220a7") return wa(pool.t1);
@@ -1289,7 +1294,7 @@ function fakeAnswer(s: FakeSub, reverts: Set<string>): string | null {
   return null;
 }
 
-function fakeBase() {
+function fakeBase(pools: FakePools = FAKE_POOLS) {
   const state = {
     counts: {} as Record<string, number>,
     calls: [] as Array<{ to: string; selector: string; tag: string; subs: FakeSub[] }>,
@@ -1306,7 +1311,7 @@ function fakeBase() {
     const [{ to, data }, tag] = req.params as [{ to: string; data: string }, string];
     const subs = readAggregate3(data);
     state.calls.push({ to, selector: data.slice(2, 10), tag, subs });
-    return reply({ result: writeResults(subs.map((s) => fakeAnswer(s, state.reverts))) });
+    return reply({ result: writeResults(subs.map((s) => fakeAnswer(s, state.reverts, pools))) });
   };
   return { state, transport };
 }
@@ -1394,6 +1399,65 @@ fl.state.rateLimited = false;
 const recovered = await flv.fetchPools();
 check("the next tick after a rate-limited start() verifies and prices",
   recovered.length === 3 && !flv.fetchNote().includes("NOT_VERIFIED"), flv.fetchNote());
+
+// ---------------------------------------------------------------------------
+// 11c. THE QUOTE CHECK'S RESOLUTION THRESHOLD.
+//
+// Derived from the tolerance, never hard-coded: see BASE_QUOTE_MIN_RAW. The
+// boundary is exercised end to end, through start() on the fake chain.
+// ---------------------------------------------------------------------------
+
+check("quoteMinRaw: 0.01% tolerance gives 40,000 raw units", quoteMinRaw(0.0001) === 40_000,
+  String(quoteMinRaw(0.0001)));
+check("quoteMinRaw: doubling the tolerance halves the threshold", quoteMinRaw(0.0002) === 20_000,
+  String(quoteMinRaw(0.0002)));
+check("BASE_QUOTE_MIN_RAW is derived from BASE_QUOTE_TOLERANCE",
+  BASE_QUOTE_MIN_RAW === quoteMinRaw(BASE_QUOTE_TOLERANCE) && BASE_QUOTE_MIN_RAW === 40_000,
+  String(BASE_QUOTE_MIN_RAW));
+
+// An Aerodrome WETH/cbBTC pool whose probe quote is EXACTLY `target` raw cbBTC
+// units, with 1,000 WETH on the input side. The smallest reserveB giving
+// floor(net * rB / (rA + net)) >= target gives exactly target, because
+// net < rA + net.
+const POOL_EDGE = "0x" + "c1".repeat(20);
+function edgePools(target: bigint): FakePools {
+  const rA = 1_000n * 10n ** 18n;
+  const amountIn = rA / BigInt(BASE_QUOTE_PROBE_DIVISOR);
+  const net = amountIn - (amountIn * FAKE_FEE_BP) / 10_000n;
+  const denom = rA + net;
+  const rB = (BigInt(target) * denom + net - 1n) / net;
+  return { ...FAKE_POOLS, [POOL_EDGE]: { aero: true, t0: WETH_KEY, t1: CBBTC_KEY, r0: rA, r1: rB } };
+}
+async function edgeRun(pools: FakePools): Promise<{ pools: Pool[]; dropped: string[] }> {
+  const venue = new BaseVenue({ transport: fakeBase(pools).transport });
+  await venue.start();
+  const priced = await venue.fetchPools();
+  return { pools: priced, dropped: venue.dropped.map((d) => `${d.what}: ${d.why}`) };
+}
+
+const atMin = await edgeRun(edgePools(BigInt(BASE_QUOTE_MIN_RAW)));
+check("a probe quote of exactly the threshold is accepted and priced",
+  atMin.pools.some((p) => p.id === POOL_EDGE) && atMin.dropped.length === 0,
+  atMin.dropped.join(" | "));
+const belowMin = await edgeRun(edgePools(BigInt(BASE_QUOTE_MIN_RAW) - 1n));
+check("a probe quote one raw unit below the threshold is dropped as unresolvable",
+  !belowMin.pools.some((p) => p.id === POOL_EDGE) &&
+    belowMin.dropped.length === 1 &&
+    belowMin.dropped[0]!.includes(POOL_EDGE) &&
+    belowMin.dropped[0]!.includes("quote of 39999 raw units cannot resolve"),
+  belowMin.dropped.join(" | "));
+
+// The input side: a USDC/cbBTC pool with 40 USDC in reserve probes 40,000 raw
+// units, 39,880 after the 30 bp fee, below the threshold.
+const thinIn = await edgeRun({
+  ...FAKE_POOLS,
+  [POOL_EDGE]: { aero: true, t0: USDC_KEY, t1: CBBTC_KEY, r0: 40_000_000n, r1: 10n ** 8n },
+});
+check("a probe input below the threshold after fee is dropped before quoting",
+  !thinIn.pools.some((p) => p.id === POOL_EDGE) &&
+    thinIn.dropped.length === 1 &&
+    thinIn.dropped[0]!.includes("probe of 39880 raw units after fee cannot resolve"),
+  thinIn.dropped.join(" | "));
 
 console.log(fail === 0 ? "\nall checks passed" : `\n${fail} FAILED`);
 process.exit(fail === 0 ? 0 : 1);

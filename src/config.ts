@@ -905,14 +905,55 @@ export const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
  */
 export const BASE_QUOTE_TOLERANCE = 0.0001;
 
-/** The startup quote check swaps reserve0 / this, in raw units of token0. */
-export const BASE_QUOTE_PROBE_DIVISOR = 10_000;
+/**
+ * The startup quote check swaps reserve0 / this, in raw units of token0: 0.1%
+ * of the reserve. Large enough that constant product's curvature (about 0.1%
+ * below a linear quote) is ten times the tolerance, so the check tells x*y=k
+ * from a linear price; small enough to be nowhere near draining the pool.
+ */
+export const BASE_QUOTE_PROBE_DIVISOR = 1_000;
 
 /**
- * Below this many raw output units, integer rounding alone can exceed
- * BASE_QUOTE_TOLERANCE, so the check cannot resolve and the pool is dropped.
+ * Integer floors in Aerodrome's volatile getAmountOut, each worth under one
+ * raw unit:
+ *
+ *   amountIn -= amountIn * fee / 10000                  fee rounded DOWN, so
+ *                                                        the net input is up to
+ *                                                        1 raw unit too high
+ *   out = amountIn * reserveB / (reserveA + amountIn)   rounded DOWN, up to
+ *                                                        1 raw unit too low
+ *
+ * Relative to our exact simulate(), the first moves the answer by under
+ * 1/amountIn and the second by under 1/out. They are ADDED here, although
+ * their signs are opposite in practice. simulate() itself is double-precision
+ * arithmetic, off by around 1e-15 relative, which is negligible at this scale.
  */
-export const BASE_QUOTE_MIN_OUT_RAW = 1_000_000;
+export const BASE_QUOTE_ROUNDING_FLOORS = 2;
+
+/**
+ * Rounding may use at most 1/this of BASE_QUOTE_TOLERANCE. The rest is left for
+ * what the check is for: a real disagreement in formula or fee.
+ */
+export const BASE_QUOTE_ROUNDING_MARGIN = 2;
+
+/**
+ * The smallest probe input AND output, in raw units, at which integer rounding
+ * cannot use more than 1/BASE_QUOTE_ROUNDING_MARGIN of `tolerance`. With both
+ * at or above it, rounding is under ROUNDING_FLOORS / quoteMinRaw(tolerance).
+ */
+export function quoteMinRaw(tolerance: number): number {
+  return Math.ceil((BASE_QUOTE_ROUNDING_FLOORS * BASE_QUOTE_ROUNDING_MARGIN) / tolerance);
+}
+
+/**
+ * 40,000 raw units at a 0.01% tolerance. A pool whose probe input or quoted
+ * output falls below it cannot be checked to that tolerance and is dropped.
+ *
+ * It replaced a hard-coded 1,000,000, which was 25x stricter than this and
+ * dropped three live Aerodrome pools whose output token, cbBTC, has only 8
+ * decimals (FINDINGS.md section 6.2).
+ */
+export const BASE_QUOTE_MIN_RAW = quoteMinRaw(BASE_QUOTE_TOLERANCE);
 
 /** Uniswap V2 pairs charge a fixed 30 bp, in the pair code itself (997/1000). */
 export const UNISWAP_V2_FEE_BP = 30;
