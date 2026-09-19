@@ -12,6 +12,31 @@ import {
   venueLimits,
 } from "../src/config.js";
 import { StreakTracker, logHeartbeat, logOpportunity, LOG_PATH } from "../src/logger.js";
+import {
+  BOOK_COLUMNS,
+  BOOK_LOG_PATH,
+  ObservedStreakTracker,
+  recordBookOutcomes,
+} from "../src/logger.js";
+import {
+  XRPL_BOOK_OFFERS_LIMIT,
+  XRPL_BOOK_PAIRS,
+  XRPL_BOOK_RESELECT_TICKS,
+} from "../src/config.js";
+import {
+  pickGapRow,
+  priceRung,
+  selectBookPairs,
+  transferRateOf,
+  walkBook,
+  type BookLevel,
+  type BookOutcome,
+} from "../src/venues/xrpl-books.js";
+import {
+  offerToLevel,
+  splitAmmOffers,
+  type RippledClient,
+} from "../src/venues/xrpl.js";
 import { StellarVenue, shardBounds } from "../src/venues/stellar.js";
 import {
   XrplVenue,
@@ -607,6 +632,7 @@ const ALLOWED_COMMANDS = new Set([
   "ledger_data",
   "amm_info",
   "account_info",
+  "book_offers",
 ]);
 
 /** The only binding that may be imported from `xrpl`. */
@@ -1458,6 +1484,552 @@ check("a probe input below the threshold after fee is dropped before quoting",
     thinIn.dropped.length === 1 &&
     thinIn.dropped[0]!.includes("probe of 39880 raw units after fee cannot resolve"),
   thinIn.dropped.join(" | "));
+
+// ---------------------------------------------------------------------------
+// 12. XRPL ORDER-BOOK OBSERVATION.
+//
+// Observation only: book figures go to data/book-gaps.csv and never reach
+// findOpportunities. These checks pin the walk, the transfer-fee rule, the
+// double-count exclusion, the pair selection, the request budget against a
+// counting fake rippled, the observed-tick streak rule, the book CSV, and that
+// AMM route keys did not move. All offline.
+// ---------------------------------------------------------------------------
+
+const lvl = (gets: number, pays: number, account = "rMaker"): BookLevel => ({ account, gets, pays });
+const near = (a: number | null | undefined, b: number, tol = 1e-9): boolean =>
+  typeof a === "number" && Math.abs(a - b) <= tol * Math.max(1, Math.abs(b));
+
+// --- walkBook ---------------------------------------------------------------
+
+const exact = walkBook([lvl(10, 5)], 5);
+check("walkBook: an exact fill of one level", near(exact?.out, 10) && exact?.levelsUsed === 1,
+  JSON.stringify(exact));
+
+// Three levels at 0.5, 1 and 2 input per output, 5 + 10 + 20 = 35 input deep.
+const ladderBook = [lvl(10, 5), lvl(10, 10), lvl(10, 20)];
+const span = walkBook(ladderBook, 20);
+check("walkBook: a fill spanning three levels, last one partial",
+  near(span?.out, 22.5) && span?.levelsUsed === 3, JSON.stringify(span));
+const shuffled = walkBook([lvl(10, 20), lvl(10, 5), lvl(10, 10)], 20);
+check("walkBook: levels are walked in price order whatever the input order",
+  near(shuffled?.out, 22.5) && shuffled?.levelsUsed === 3, JSON.stringify(shuffled));
+check("walkBook: the whole book is a fill, not a run-out",
+  near(walkBook(ladderBook, 35)?.out, 30));
+check("walkBook: a book that runs out returns null, never a partial fill",
+  walkBook(ladderBook, 35.001) === null && walkBook([], 1) === null);
+
+// Funded amounts: the owner posted 100 T for 50 XRP but can fund only 40 T.
+const fundedLevel = offerToLevel({
+  Account: "rMaker",
+  TakerGets: { currency: "USD", issuer: RIPPLE_USD_ISSUER, value: "100" },
+  TakerPays: "50000000",
+  taker_gets_funded: { currency: "USD", issuer: RIPPLE_USD_ISSUER, value: "40" },
+  taker_pays_funded: "20000000",
+}, xReal, "XRP");
+check("offerToLevel: *_funded amounts are used when present",
+  fundedLevel?.gets === 40 && fundedLevel?.pays === 20, JSON.stringify(fundedLevel));
+check("walkBook: an underfunded offer only fills what is funded",
+  walkBook([fundedLevel!], 20.5) === null && near(walkBook([fundedLevel!], 20)?.out, 40));
+
+// Drops conversion, on both sides of the book.
+const dropsPays = offerToLevel({
+  Account: "rMaker",
+  TakerGets: { currency: "USD", issuer: RIPPLE_USD_ISSUER, value: "2.5" },
+  TakerPays: "1000000",
+}, xReal, "XRP");
+const dropsGets = offerToLevel({
+  Account: "rMaker",
+  TakerGets: "1500000",
+  TakerPays: { currency: "USD", issuer: RIPPLE_USD_ISSUER, value: "4" },
+}, "XRP", xReal);
+check("offerToLevel: drops become whole XRP on either side",
+  dropsPays?.pays === 1 && dropsPays?.gets === 2.5 && dropsGets?.gets === 1.5 && dropsGets?.pays === 4,
+  `${JSON.stringify(dropsPays)} ${JSON.stringify(dropsGets)}`);
+check("offerToLevel: an offer for a different asset than the book asked for is dropped",
+  offerToLevel({
+    Account: "rMaker",
+    TakerGets: { currency: "USD", issuer: OTHER_USD_ISSUER, value: "2.5" },
+    TakerPays: "1000000",
+  }, xReal, "XRP") === null);
+
+// Transfer fee: spending T at rate r delivers amountIn / r to the book.
+const feeOut = walkBook(ladderBook, 20, 1.002);
+check("walkBook: a transfer fee is the same as spending amountIn / rate",
+  near(feeOut?.out, walkBook(ladderBook, 20 / 1.002)!.out) && feeOut!.out < span!.out,
+  JSON.stringify(feeOut));
+check("walkBook: a transfer rate below 1 is refused", walkBook(ladderBook, 1, 0.99) === null);
+
+check("transferRateOf: absent and 0 are no fee, billionths otherwise, junk refused",
+  transferRateOf(undefined) === 1 && transferRateOf(0) === 1 &&
+    transferRateOf(1_002_000_000) === 1.002 && transferRateOf(1_000_000_000) === 1 &&
+    transferRateOf(999) === null && transferRateOf(2_000_000_001) === null &&
+    transferRateOf("1002000000") === null);
+
+// The realised rate never improves with size.
+let lastRate = Infinity;
+let rateRose = "";
+for (let s = 0.25; s <= 35; s += 0.25) {
+  const r = walkBook(ladderBook, s)!.out / s;
+  if (r > lastRate + 1e-12) rateRose = `rose at ${s}: ${r} > ${lastRate}`;
+  lastRate = r;
+}
+check("walkBook: the realised rate never rises with size", rateRose === "", rateRose);
+
+// --- Double count -----------------------------------------------------------
+
+const withAmm = splitAmmOffers([
+  { Account: "rAmmAccount", TakerGets: "1", TakerPays: "1" },
+  { Account: "rMaker", TakerGets: "1", TakerPays: "1" },
+], "rAmmAccount");
+check("double-count: an offer owned by the AMM account is counted and excluded",
+  withAmm.ammOwned === 1 && withAmm.kept.length === 1 && withAmm.kept[0]!.Account === "rMaker");
+
+// --- Pricing and the row rule -------------------------------------------------
+
+const XL = limitsFor("xrpl");
+const bookPool: Pool = { id: "rAmmBook", a: "XRP", b: xReal, ra: 10_000, rb: 25_000, feeBp: 30 };
+// The book sells T at 2.6 per XRP against an AMM at 2.5: book>amm should clear.
+const cheapBuy = [lvl(26_000, 10_000)];
+// It buys T at 3 per XRP, far worse than the AMM: amm>book should not.
+const dearSell = [lvl(10_000, 30_000)];
+const ladder = XL.sizeLadder.filter((s) => s <= XL.maxSize);
+const figs = ladder.map((r) => priceRung(x, bookPool, cheapBuy, dearSell, r, 1));
+const gapPick = pickGapRow(figs, x.feeNative, XL);
+const bestNet = Math.max(...figs.map((f) => f.bookThenAmm! - f.rung - x.feeNative));
+check("row rule: book>amm qualifies, amm>book does not",
+  gapPick.qualifying.length === 1 && gapPick.qualifying[0] === "book>amm",
+  JSON.stringify(gapPick.qualifying));
+check("row rule: the one row is at the rung with the largest net profit",
+  gapPick.pick !== null && near(gapPick.pick.netProfit, bestNet) && gapPick.pick.direction === "book>amm",
+  JSON.stringify(gapPick.pick));
+check("pricing: an AMM-only round trip always loses",
+  figs.every((f) => f.ammOut < f.rung));
+
+// Book legs by hand at rung 10: 26 T off the book, then T -> XRP on the AMM.
+const f10 = figs.find((f) => f.rung === 10)!;
+check("pricing: book>amm at rung 10 matches the hand calculation",
+  near(f10.bookThenAmm, x.simulate(bookPool, xReal, 26)) && f10.buyLevels === 1,
+  JSON.stringify(f10));
+
+// Transfer fee on the spending hop only, for AMM and book legs alike.
+const f10fee = priceRung(x, bookPool, cheapBuy, dearSell, 10, 1.01);
+check("pricing: the transfer fee is charged where the cycle spends T, on AMM and book legs",
+  near(f10fee.bookThenAmm, x.simulate(bookPool, xReal, 26 / 1.01)) &&
+    near(f10fee.ammOut, x.simulate(bookPool, xReal, x.simulate(bookPool, "XRP", 10) / 1.01)) &&
+    near(f10fee.ammThenBook, walkBook(dearSell, x.simulate(bookPool, "XRP", 10), 1.01)!.out),
+  JSON.stringify(f10fee));
+
+// A book that runs out yields null at larger rungs, and no row is picked there.
+const thinFigs = ladder.map((r) => priceRung(x, bookPool, [lvl(26, 10)], dearSell, r, 1));
+const thinPick = pickGapRow(thinFigs, x.feeNative, XL);
+check("pricing: a rung the book cannot carry is null, and never picked",
+  thinFigs.filter((f) => f.rung > 10).every((f) => f.bookThenAmm === null && f.bookOut === null) &&
+    thinPick.pick !== null && thinPick.pick.figures.rung <= 10,
+  JSON.stringify(thinPick.pick?.figures));
+
+// Fair books: nothing qualifies, nothing is written.
+const fairFigs = ladder.map((r) => priceRung(x, bookPool, [lvl(24_500, 10_000)], dearSell, r, 1));
+const fairPick = pickGapRow(fairFigs, x.feeNative, XL);
+check("row rule: fair books produce no row and no qualifying direction",
+  fairPick.pick === null && fairPick.qualifying.length === 0);
+
+// --- Selection ----------------------------------------------------------------
+
+const ISS = "rFakessuerBBBBBBBBBBBBBBBBBBBB";
+const selPools: Pool[] = Array.from({ length: 12 }, (_, i) => ({
+  id: `rAmmSel${i}`, a: "XRP", b: `C${String(i).padStart(2, "0")}:${ISS}`,
+  ra: 2_000 + 1_000 * i, rb: 5_000, feeBp: 30,
+}));
+selPools.push(
+  { id: "rAmmShallow", a: "XRP", b: `SHL:${ISS}`, ra: 500, rb: 5_000, feeBp: 30 },
+  { id: "rAmmTokTok", a: `C00:${ISS}`, b: `C01:${ISS}`, ra: 9e9, rb: 9e9, feeBp: 30 },
+  // A second pool for C00, deeper than any other: merged, and it wins.
+  { id: "rAmmDup", a: `C00:${ISS}`, b: "XRP", ra: 5_000, rb: 50_000, feeBp: 30 },
+  // Ties C05 on depth; broken by key.
+  { id: "rAmmTie", a: "XRP", b: `C04b:${ISS}`, ra: 7_000, rb: 5_000, feeBp: 30 },
+);
+const sel = selectBookPairs(x, selPools, XL.minPoolNative, XRPL_BOOK_PAIRS);
+const selKeys = sel.map((p) => p.counterKey.split(":")[0]).join(",");
+check("selection: capped at N, deepest first, merged by counter-asset",
+  sel.length === XRPL_BOOK_PAIRS && XRPL_BOOK_PAIRS === 10 &&
+    selKeys === "C00,C11,C10,C09,C08,C07,C06,C04b,C05,C04" &&
+    sel[0]!.ammAccount === "rAmmDup" && sel[0]!.nativeReserve === 50_000,
+  selKeys);
+check("selection: shallow and token-to-token pools are never selected",
+  !sel.some((p) => p.counterKey.startsWith("SHL") || p.ammAccount === "rAmmTokTok"));
+const reversedSel = selectBookPairs(x, [...selPools].reverse(), XL.minPoolNative, XRPL_BOOK_PAIRS);
+check("selection: deterministic under input order",
+  JSON.stringify(reversedSel) === JSON.stringify(sel));
+
+// --- A counting fake rippled ------------------------------------------------
+
+const FAKE_LEDGER = 90_000_001;
+const LETTERS = "ABCDEFGHJKLM"; // base58 has no I
+const fakeTokens = [...LETTERS].map((c, i) => ({
+  currency: `T${c}${c}`,
+  issuer: `rFakessuer${c.repeat(20)}`,
+  amm: `rFakeAmm${c.repeat(22)}`,
+  native: 2_000 + 1_000 * i,
+}));
+
+interface FakeXrplState {
+  calls: Array<{ command: string; ledger_index?: unknown; account?: unknown }>;
+  gap: boolean;
+  bookFail: boolean;
+  unpinned: boolean;
+  /** Issuers whose account_info throws. */
+  infoFail: Set<string>;
+  /**
+   * When set, every XRP -> T book is exactly this many small offers (0.1 XRP
+   * each, no AMM-owned offer), so upper rungs run out on it.
+   */
+  thinOffers: number | null;
+}
+
+function fakeXrpl(): { client: RippledClient; state: FakeXrplState } {
+  const state: FakeXrplState = {
+    calls: [], gap: true, bookFail: false, unpinned: false, infoFail: new Set(), thinOffers: null,
+  };
+  const tokenOf = (spec: any) => fakeTokens.find((t) => t.issuer === spec?.issuer);
+  const iou = (t: (typeof fakeTokens)[number], value: number) =>
+    ({ currency: t.currency, issuer: t.issuer, value: String(value) });
+
+  const request = async (req: any): Promise<any> => {
+    state.calls.push({ command: req.command, ledger_index: req.ledger_index, account: req.account });
+    switch (req.command) {
+      case "ledger":
+        if (state.unpinned) throw new Error("fake: ledger unavailable");
+        return { result: { ledger_index: FAKE_LEDGER } };
+      case "amm_info": {
+        const ta = tokenOf(req.asset);
+        const tb = tokenOf(req.asset2);
+        const t = ta && tb ? undefined : (ta ?? tb);
+        if (!t) throw Object.assign(new Error("fake: no amm"), { data: { error: "actNotFound" } });
+        return {
+          result: {
+            amm: {
+              account: t.amm,
+              amount: String(t.native * 1_000_000),
+              amount2: iou(t, t.native * 2.5),
+              trading_fee: 300,
+            },
+          },
+        };
+      }
+      case "account_info":
+        if (state.infoFail.has(req.account)) throw new Error("fake: account_info down");
+        return { result: { account_data: { TransferRate: 1_002_000_000 } } };
+      case "book_offers": {
+        if (state.bookFail) throw new Error("fake: book_offers down");
+        const buying = tokenOf(req.taker_gets);
+        if (buying && state.thinOffers !== null) {
+          return {
+            result: {
+              offers: Array.from({ length: state.thinOffers }, () => ({
+                Account: "rFakeMakerAAAAAAAAAAAAAAAAAAAA",
+                TakerGets: iou(buying, 0.26),
+                TakerPays: "100000",
+              })),
+            },
+          };
+        }
+        if (buying) {
+          // Taker pays XRP, gets T. The AMM-owned offer is absurdly cheap: if
+          // it were walked, every tick would show a huge gap.
+          return {
+            result: {
+              offers: [
+                { Account: buying.amm, TakerGets: iou(buying, 1_000_000), TakerPays: "1000000" },
+                {
+                  Account: "rFakeMakerAAAAAAAAAAAAAAAAAAAA",
+                  TakerGets: iou(buying, (state.gap ? 2.6 : 2.45) * 100_000),
+                  TakerPays: String(100_000 * 1_000_000),
+                },
+              ],
+            },
+          };
+        }
+        const selling = tokenOf(req.taker_pays)!;
+        return {
+          result: {
+            offers: [{
+              Account: "rFakeMakerAAAAAAAAAAAAAAAAAAAA",
+              TakerGets: String(100_000 * 1_000_000),
+              TakerPays: iou(selling, 2.55 * 100_000),
+            }],
+          },
+        };
+      }
+      default:
+        throw new Error(`fake: unexpected command ${req.command}`);
+    }
+  };
+
+  const client = {
+    request,
+    isConnected: () => true,
+    connect: async () => {},
+    disconnect: async () => {},
+  } as unknown as RippledClient;
+  return { client, state };
+}
+
+const fx = fakeXrpl();
+const fakeVenue = new XrplVenue(
+  fakeTokens.map((t) => ({ currency: t.currency, issuer: t.issuer })),
+  { client: fx.client },
+);
+
+/** One XRPL tick as monitor.ts runs it, returning what the book phase issued. */
+async function fakeTick(
+  tracker: ObservedStreakTracker,
+  at: Date,
+  csvPath: string,
+  venue: XrplVenue = fakeVenue,
+  f: { state: FakeXrplState } = fx,
+) {
+  const pools = await venue.fetchPools();
+  const before = findOpportunities(venue, pools, XL);
+  const mark = f.state.calls.length;
+  const obs = await venue.observeBooks(pools, XL);
+  const bookCalls = f.state.calls.slice(mark);
+  const after = findOpportunities(venue, pools, XL);
+  recordBookOutcomes(tracker, obs.outcomes, at, 60_000, csvPath);
+  const infos = bookCalls.filter((c) => c.command === "account_info");
+  return {
+    obs,
+    books: bookCalls.filter((c) => c.command === "book_offers"),
+    accountInfos: infos.length,
+    infoAccounts: infos.map((c) => String(c.account)),
+    unchanged: JSON.stringify(before) === JSON.stringify(after),
+  };
+}
+
+/** A fresh fake rippled and a venue on it, for tests that need their own state. */
+function freshFakeVenue() {
+  const f = fakeXrpl();
+  const venue = new XrplVenue(
+    fakeTokens.map((t) => ({ currency: t.currency, issuer: t.issuer })),
+    { client: f.client },
+  );
+  return { f, venue };
+}
+
+const FAKE_BOOK_CSV = resolve(tmpdir(), "multi-pulse-check-book-fake.csv");
+rmSync(FAKE_BOOK_CSV, { force: true });
+const fakeTracker = new ObservedStreakTracker();
+const tAt = (n: number) => new Date(Date.UTC(2026, 8, 19, 0, n));
+
+const tick1 = await fakeTick(fakeTracker, tAt(0), FAKE_BOOK_CSV);
+check("budget: exactly 2N book_offers on the first tick",
+  tick1.books.length === 2 * XRPL_BOOK_PAIRS, `${tick1.books.length}`);
+check("budget: every book_offers is pinned to the tick's amm_info ledger",
+  tick1.books.every((c) => c.ledger_index === FAKE_LEDGER) &&
+    fakeVenue.lastFetch.ledgerIndex === FAKE_LEDGER);
+check("budget: one account_info per selected issuer on the selection tick",
+  tick1.accountInfos === XRPL_BOOK_PAIRS, `${tick1.accountInfos}`);
+check("selection: the fake's 10 deepest of 12 XRP pools are selected",
+  fakeVenue.selectedBookPairs.length === XRPL_BOOK_PAIRS &&
+    fakeVenue.selectedBookPairs.map((p) => p.currency).join(",") ===
+      "TMM,TLL,TKK,TJJ,THH,TGG,TFF,TEE,TDD,TCC",
+  fakeVenue.selectedBookPairs.map((p) => p.currency).join(","));
+check("double-count: AMM-owned offers are counted in the heartbeat",
+  fakeVenue.fetchNote().includes(" amm_in_book=10 ") &&
+    fakeVenue.fetchNote().includes(" books=20 book_errors=0 "),
+  fakeVenue.fetchNote());
+check("double-count: the excluded AMM offer never priced a row",
+  tick1.obs.outcomes.length === 10 &&
+    tick1.obs.outcomes.every((o) => o.row !== null && o.row.netBps < 1_000),
+  JSON.stringify(tick1.obs.outcomes[0]?.row));
+check("observation leaves findOpportunities' output untouched", tick1.unchanged);
+
+// A failed book tick: no data, so the streaks must be neither extended nor reset.
+fx.state.bookFail = true;
+const tick2 = await fakeTick(fakeTracker, tAt(1), FAKE_BOOK_CSV);
+check("budget: 2N book_offers and no account_info on an ordinary tick",
+  tick2.books.length === 2 * XRPL_BOOK_PAIRS && tick2.accountInfos === 0);
+check("a failed book tick is counted as skipped, not observed",
+  tick2.obs.outcomes.length === 0 &&
+    fakeVenue.fetchNote().includes(" book_errors=20 ") &&
+    fakeVenue.fetchNote().includes(" book_skipped=10"),
+  fakeVenue.fetchNote());
+fx.state.bookFail = false;
+
+const tick3 = await fakeTick(fakeTracker, tAt(2), FAKE_BOOK_CSV);
+
+// An unpinned tick: nothing to pin the books to, so none are read.
+fx.state.unpinned = true;
+const tick4 = await fakeTick(fakeTracker, tAt(3), FAKE_BOOK_CSV);
+check("budget: no book_offers when the tick's ledger is unpinned",
+  tick4.books.length === 0 && fakeVenue.fetchNote().includes(" book_skipped=10"),
+  fakeVenue.fetchNote());
+fx.state.unpinned = false;
+
+await fakeTick(fakeTracker, tAt(4), FAKE_BOOK_CSV);
+
+// Read, and not qualifying: that alone resets.
+fx.state.gap = false;
+const tick6 = await fakeTick(fakeTracker, tAt(5), FAKE_BOOK_CSV);
+fx.state.gap = true;
+await fakeTick(fakeTracker, tAt(6), FAKE_BOOK_CSV);
+
+const fakeRows = readFileSync(FAKE_BOOK_CSV, "utf8").trim().split("\n").slice(1).map((l) => l.split(","));
+const colOf = (name: string) => (BOOK_COLUMNS as readonly string[]).indexOf(name);
+const tmmStreaks = fakeRows
+  .filter((r) => r[colOf("pair_key")] === `XRP/TMM:rFakessuer${"M".repeat(20)}`)
+  .map((r) => r[colOf("streak_ticks")])
+  .join(",");
+check("streaks: failed and unpinned ticks neither extend nor reset; a read miss resets",
+  tick3.obs.outcomes.length === 10 && tick6.obs.outcomes.every((o) => o.row === null) &&
+    tmmStreaks === "1,2,3,1",
+  tmmStreaks);
+check("book rows carry the pinned ledger and the transfer rate",
+  fakeRows.every((r) => r[colOf("ledger")] === String(FAKE_LEDGER) &&
+    r[colOf("transfer_rate")] === "1.002000000"));
+rmSync(FAKE_BOOK_CSV, { force: true });
+
+// Reselection: account_info again only on tick K + 1.
+let reselectAt = -1;
+let extraInfos = 0;
+for (let t = 8; t <= XRPL_BOOK_RESELECT_TICKS + 1; t++) {
+  const r = await fakeTick(new ObservedStreakTracker(), tAt(t), resolve(tmpdir(), "multi-pulse-check-book-discard.csv"));
+  if (r.accountInfos > 0) {
+    if (reselectAt < 0) reselectAt = t;
+    else extraInfos++;
+  }
+  if (r.books.length !== 2 * XRPL_BOOK_PAIRS) extraInfos += 1000;
+}
+check("reselection happens every K ticks, and only then",
+  XRPL_BOOK_RESELECT_TICKS === 30 && reselectAt === XRPL_BOOK_RESELECT_TICKS + 1 && extraInfos === 0,
+  `at=${reselectAt} extra=${extraInfos}`);
+
+const DISCARD_CSV = resolve(tmpdir(), "multi-pulse-check-book-discard.csv");
+
+// Transfer-rate retry: a failed account_info is retried next tick, for that
+// issuer only, and once every rate is known no account_info is made at all.
+{
+  const { f, venue } = freshFakeVenue();
+  const flaky = fakeTokens.find((t) => t.currency === "TMM")!.issuer;
+  f.state.infoFail.add(flaky);
+  const r1 = await fakeTick(new ObservedStreakTracker(), tAt(40), DISCARD_CSV, venue, f);
+  const note1 = venue.fetchNote();
+  f.state.infoFail.clear();
+  const r2 = await fakeTick(new ObservedStreakTracker(), tAt(41), DISCARD_CSV, venue, f);
+  const note2 = venue.fetchNote();
+  const r3 = await fakeTick(new ObservedStreakTracker(), tAt(42), DISCARD_CSV, venue, f);
+  check("retry: the selection tick reads every issuer; the failed one's pair is skipped",
+    r1.accountInfos === XRPL_BOOK_PAIRS && r1.books.length === 2 * (XRPL_BOOK_PAIRS - 1) &&
+      note1.includes(" book_errors=1 ") && note1.includes(" book_skipped=1"),
+    `infos=${r1.accountInfos} books=${r1.books.length} ${note1}`);
+  check("retry: the next tick makes one account_info, for the failed issuer only",
+    r2.accountInfos === 1 && r2.infoAccounts[0] === flaky &&
+      r2.books.length === 2 * XRPL_BOOK_PAIRS && note2.includes(" book_skipped=0"),
+    `${r2.infoAccounts.join(",")} ${note2}`);
+  check("retry: once every rate is known, a tick makes no account_info",
+    r3.accountInfos === 0 && r3.books.length === 2 * XRPL_BOOK_PAIRS,
+    `infos=${r3.accountInfos}`);
+}
+
+// book_capped: a run-out on a reply of exactly the offer limit is counted, and
+// the same run-out on a shorter reply is not. Each thin book is N offers of
+// 0.1 XRP, so it runs out below the 25 XRP rung either way.
+{
+  const { f, venue } = freshFakeVenue();
+  f.state.thinOffers = XRPL_BOOK_OFFERS_LIMIT;
+  const atLimit = await fakeTick(new ObservedStreakTracker(), tAt(50), DISCARD_CSV, venue, f);
+  const noteAt = venue.fetchNote();
+  f.state.thinOffers = XRPL_BOOK_OFFERS_LIMIT - 1;
+  const underLimit = await fakeTick(new ObservedStreakTracker(), tAt(51), DISCARD_CSV, venue, f);
+  const noteUnder = venue.fetchNote();
+  const ranOut = (o: BookOutcome[]) =>
+    o.length === XRPL_BOOK_PAIRS && o.every((x) => x.row !== null && x.row.rung <= 16);
+  check("book_capped: a run-out on a reply of exactly the limit is counted",
+    ranOut(atLimit.obs.outcomes) && noteAt.includes(` book_capped=${XRPL_BOOK_PAIRS} `),
+    noteAt);
+  check("book_capped: the same run-out on a shorter reply is not",
+    ranOut(underLimit.obs.outcomes) && noteUnder.includes(" book_capped=0 "),
+    noteUnder);
+}
+rmSync(DISCARD_CSV, { force: true });
+
+// --- The streak rule on its own: qualify, fail, qualify ----------------------
+
+const STREAK_CSV = resolve(tmpdir(), "multi-pulse-check-book-streak.csv");
+rmSync(STREAK_CSV, { force: true });
+const oneRow = (): BookOutcome => ({
+  pairKey: "XRP/USD:rTest",
+  qualifying: ["book>amm"],
+  row: {
+    ledger: 1, pairKey: "XRP/USD:rTest", pairLabel: "XRP/USD", direction: "book>amm",
+    rung: 10, ammOut: 9.9, bookOut: null, bookThenAmm: 10.1, ammThenBook: null,
+    feeNative: 0.0001, netProfit: 0.0999, netBps: 99.9, mixedVsAmmBps: 200,
+    levelsUsed: 2, transferRate: 1, ammFeeBp: 30,
+  },
+});
+const st = new ObservedStreakTracker();
+recordBookOutcomes(st, [oneRow()], tAt(0), 60_000, STREAK_CSV); // qualifying tick
+recordBookOutcomes(st, [], tAt(1), 60_000, STREAK_CSV); // failed tick: pair not read
+recordBookOutcomes(st, [oneRow()], tAt(2), 60_000, STREAK_CSV); // qualifying tick
+const streakCsv = readFileSync(STREAK_CSV, "utf8").trim().split("\n");
+check("streak: qualifying, failed, qualifying gives streak_ticks = 2, not 1",
+  streakCsv.length === 3 && streakCsv[2]!.split(",")[colOf("streak_ticks")] === "2" &&
+    streakCsv[2]!.split(",")[colOf("first_seen")] === tAt(0).toISOString(),
+  streakCsv[2]);
+
+// --- The book CSV -------------------------------------------------------------
+
+check("book CSV header matches the agreed columns",
+  streakCsv[0] ===
+    "timestamp,ledger,pair_key,pair_label,direction,rung,amm_out,book_out,book_then_amm_out,amm_then_book_out,fee_native,net_profit,best_gap_bps,mixed_vs_amm_bps,levels_used,transfer_rate,amm_fee_bp,first_seen,last_seen,streak_ticks,tick_interval_ms",
+  streakCsv[0]);
+check("book CSV row has 21 fields, an empty field for a null book figure",
+  streakCsv[1]!.split(",").length === 21 && streakCsv[1]!.split(",")[colOf("book_out")] === "",
+  streakCsv[1]);
+rmSync(STREAK_CSV, { force: true });
+const FORBIDDEN_BOOK = "rmSync(" + "BOOK_LOG_PATH";
+check("the book CSV tests never touch the live book log",
+  ![FAKE_BOOK_CSV, STREAK_CSV].includes(BOOK_LOG_PATH) &&
+    !readFileSync(fileURLToPath(import.meta.url), "utf8").includes(FORBIDDEN_BOOK));
+
+// --- Read-only property, for the new reads ------------------------------------
+
+check("allow-list: book_offers is allowed, and still no write command",
+  ALLOWED_COMMANDS.has("book_offers") &&
+    !["submit", "submit_multisigned", "sign", "sign_for"].some((c) => ALLOWED_COMMANDS.has(c)));
+const xrplSrc = sources.find((s) => s.path.endsWith(join("venues", "xrpl.ts")))!.raw;
+const booksSrc = sources.find((s) => s.path.endsWith(join("venues", "xrpl-books.ts")))?.raw ?? "";
+check("the xrpl import is still Client-only, and the book module imports nothing from xrpl",
+  [...xrplSrc.matchAll(/from\s+["']xrpl["']/g)].length === 1 &&
+    xrplSrc.includes('import { Client } from "xrpl";') &&
+    booksSrc.length > 0 && !/from\s+["']xrpl["']/.test(booksSrc));
+check("the book module issues no rippled command at all",
+  !/\bcommand\s*:/.test(codeOnly(booksSrc, true)));
+check("book_offers is issued, as a literal, in xrpl.ts",
+  /command:\s*"book_offers"/.test(codeOnly(xrplSrc, true)));
+check("XRPL_BOOK_OFFERS_LIMIT is what is asked for",
+  /limit:\s*XRPL_BOOK_OFFERS_LIMIT/.test(xrplSrc) && XRPL_BOOK_OFFERS_LIMIT === 200);
+
+// --- AMM route keys did not move ----------------------------------------------
+//
+// Captured from findOpportunities BEFORE any book code existed, on this exact
+// fixture: two direct routes (one through a hex currency) and one triangle.
+const PINNED_ROUTE_KEYS = JSON.stringify([
+  "XRP>USD:rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B>EUR:rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq>XRP",
+  "XRP>586F676500000000000000000000000000000000:rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B>XRP",
+  "XRP>USD:rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B>XRP",
+]);
+const pinEur = `EUR:${OTHER_USD_ISSUER}`;
+const pinHex = `${XOGE_HEX}:${RIPPLE_USD_ISSUER}`;
+const pinnedKeys = JSON.stringify(findOpportunities(x, [
+  { id: "rk1", a: "XRP", b: xReal, ra: 100_000, rb: 250_000, feeBp: 30 },
+  { id: "rk2", a: "XRP", b: xReal, ra: 100_000, rb: 230_000, feeBp: 30 },
+  { id: "rk3", a: "XRP", b: pinEur, ra: 100_000, rb: 200_000, feeBp: 30 },
+  { id: "rk4", a: xReal, b: pinEur, ra: 100_000, rb: 100_000, feeBp: 30 },
+  { id: "rk5", a: pinHex, b: "XRP", ra: 500_000, rb: 50_000, feeBp: 20 },
+  { id: "rk6", a: pinHex, b: "XRP", ra: 450_000, rb: 50_000, feeBp: 20 },
+]).map((o) => o.routeKey));
+check("AMM route keys are byte-identical to those pinned before the book change",
+  pinnedKeys === PINNED_ROUTE_KEYS, pinnedKeys);
 
 console.log(fail === 0 ? "\nall checks passed" : `\n${fail} FAILED`);
 process.exit(fail === 0 ? 0 : 1);

@@ -548,3 +548,61 @@ examined, and nothing is claimed about them here.
 The Base module is operationally sound and was merged into `main` on 19 September 2026.
 The measurement's main weakness is environmental: power and network. Any future run
 intended as evidence needs mains power and network continuity addressed first.
+
+## 8. XRPL order books next to the AMM: pre-registered hypothesis
+
+Written on 19 September 2026, before any run of the order-book observation. Nothing in
+this section is a result. Results will be added below after the run, and this text will
+not be edited to fit them.
+
+### 8.1 Hypothesis
+
+XRPL interleaves AMM and order-book liquidity in every payment and every offer, and
+auction-slot holders trade against the AMM at a reduced or zero fee. Therefore gaps
+between the order book and the AMM that clear the fee floor will be rare and short-lived:
+mostly single-tick sightings at small rungs.
+
+### 8.2 What is measured
+
+- **Pairs.** The 10 deepest XRP pools that pass the 1,000 XRP depth floor, ranked by XRP
+  reserve, one per counter-asset. The selection is recomputed every 30 XRPL ticks (about
+  30 minutes) and printed to the console on each selection.
+- **Reads.** Both order books of each pair, 20 `book_offers` per tick, pinned to the same
+  ledger as that tick's `amm_info` reads. Each issuer's `TransferRate` is read with
+  `account_info` on each selection. If that read fails, it is retried on each following
+  tick, one `account_info` per missing issuer, until it succeeds; meanwhile that issuer's
+  pairs are skipped. A tick with every rate known makes no `account_info` call.
+- **Cycles.** At each rung of the XRPL ladder (0.1 to 100 XRP), four round trips from XRP
+  back to XRP: AMM only, book only, book then AMM, AMM then book. Books are walked level by
+  level using funded amounts. A rung the book cannot fill has no book figure, never a
+  mid-price stand-in.
+- **The mixed figures are lower bounds.** The payment engine blends AMM and book within a
+  single hop. These cycles use one venue per hop, so the engine would do at least as well.
+- **Costs.** The AMM's full `trading_fee` (not an auction-slot discount), the same flat
+  network fee as the AMM search, and the issuer's transfer fee charged once per cycle on
+  the hop that spends the token, for book and AMM legs alike. Whether the transfer fee
+  applies when the AMM is the counterparty is unverified; it is charged regardless.
+- **Double count.** Offers whose `Account` is the pair's own AMM account are counted
+  (`amm_in_book`) and excluded from the walk.
+- **Rows.** One row in `data/book-gaps.csv` per pair per tick, only when a mixed cycle
+  clears the AMM search's floors (net profit of at least 0.001 XRP and 20 bps after the
+  network fee), at the qualifying rung and direction with the largest net profit.
+- **Streaks count observed ticks only.** A tick in which a pair was not read (failed read,
+  no pinned ledger, missing pool or transfer rate) neither extends nor resets its streak.
+  Only a pinned tick in which the pair was read and did not qualify resets it. Such ticks
+  are counted per tick as `book_skipped` in the heartbeat.
+
+### 8.3 Verdict criteria, fixed now
+
+- **Mid-ladder** means rungs from 5 to 40 XRP.
+- **Refuted** if any pair and direction shows a run of 3 or more consecutive observed ticks
+  at a mid-ladder rung, on 3 or more occasions separated by at least 1 hour.
+- **Supported** if at least 90% of rows have `streak_ticks` = 1, with the remainder
+  described.
+- **Neither** otherwise.
+- **No verdict either way from less than 48 hours of actual observation.** Gaps in
+  collection and failed ticks are excluded from that total.
+
+### 8.4 Results
+
+To be added after the run.

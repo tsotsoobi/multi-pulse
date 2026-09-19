@@ -3,6 +3,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Opportunity } from "./arb.js";
+import {
+  BOOK_DIRECTIONS,
+  bookStreakKey,
+  type BookGap,
+  type BookOutcome,
+} from "./venues/xrpl-books.js";
 
 // Resolved against this file rather than cwd, so the CSV lands in the repo's
 // data/ directory no matter where the process was started from.
@@ -220,6 +226,174 @@ export class StreakTracker {
   /** Routes currently on an unbroken run. */
   get activeCount(): number {
     return this.runs.size;
+  }
+}
+
+/**
+ * Streaks for the order-book observation, counted in OBSERVED ticks.
+ *
+ * Deliberately not StreakTracker, whose rule is the opposite and is right for
+ * the AMM search: there, every tick is a tick, and a failed one breaks a
+ * streak. Here that would be wrong in a way that matters. The book hypothesis
+ * (FINDINGS.md section 8) is about whether gaps recur across consecutive
+ * ticks, and a tick with no book data is not evidence that a gap closed. If a
+ * failed or unpinned tick reset a streak, every outage would manufacture
+ * short-lived gaps and bias the result toward the hypothesis.
+ *
+ * So there are exactly two events per key, and silence is neither:
+ *
+ *   mark(key)  the pair was read at a pinned ledger and this direction
+ *              qualified. Extends the run, or starts one.
+ *   miss(key)  the pair was read at a pinned ledger and this direction did
+ *              not qualify. Ends the run.
+ *
+ * A tick in which the pair was not read calls neither, so the run is carried
+ * across it untouched: its tick count does not grow, and it does not reset.
+ * How often that happened is reported as book_skipped in the heartbeat.
+ */
+export class ObservedStreakTracker {
+  private runs = new Map<string, { firstSeen: string; firstMs: number; ticks: number }>();
+
+  mark(key: string, at: Date): Streak {
+    const nowIso = at.toISOString();
+    const nowMs = at.getTime();
+    const run = this.runs.get(key);
+    if (!run) {
+      this.runs.set(key, { firstSeen: nowIso, firstMs: nowMs, ticks: 1 });
+      return { firstSeen: nowIso, lastSeen: nowIso, ticks: 1, seconds: 0 };
+    }
+    run.ticks++;
+    return {
+      firstSeen: run.firstSeen,
+      lastSeen: nowIso,
+      ticks: run.ticks,
+      seconds: (nowMs - run.firstMs) / 1000,
+    };
+  }
+
+  miss(key: string): void {
+    this.runs.delete(key);
+  }
+
+  get activeCount(): number {
+    return this.runs.size;
+  }
+}
+
+export const BOOK_LOG_PATH = resolve(DATA_DIR, "book-gaps.csv");
+
+export const BOOK_COLUMNS = [
+  "timestamp",
+  "ledger",
+  "pair_key",
+  "pair_label",
+  "direction",
+  "rung",
+  "amm_out",
+  "book_out",
+  "book_then_amm_out",
+  "amm_then_book_out",
+  "fee_native",
+  "net_profit",
+  "best_gap_bps",
+  "mixed_vs_amm_bps",
+  "levels_used",
+  "transfer_rate",
+  "amm_fee_bp",
+  "first_seen",
+  "last_seen",
+  "streak_ticks",
+  "tick_interval_ms",
+] as const;
+
+/** Empty when a book leg ran out at this rung. Never a stand-in number. */
+function optional(n: number | null, digits: number): string {
+  return n === null ? "" : n.toFixed(digits);
+}
+
+/**
+ * One row of data/book-gaps.csv. Its own file with its own header, so nothing
+ * about the observation can change a byte of data/opportunities.csv.
+ *
+ * `path` exists for the test suite only, exactly as for appendRow: nothing in
+ * src/ passes it, and the tests must never write to BOOK_LOG_PATH.
+ */
+export function logBookGap(
+  g: BookGap,
+  streak: Streak,
+  at: Date,
+  tickIntervalMs: number,
+  path: string = BOOK_LOG_PATH,
+): void {
+  try {
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const isNew = !existsSync(path);
+
+    const line = [
+      at.toISOString(),
+      String(g.ledger),
+      g.pairKey,
+      g.pairLabel,
+      g.direction,
+      String(g.rung),
+      g.ammOut.toFixed(7),
+      optional(g.bookOut, 7),
+      optional(g.bookThenAmm, 7),
+      optional(g.ammThenBook, 7),
+      g.feeNative.toFixed(7),
+      g.netProfit.toFixed(7),
+      g.netBps.toFixed(2),
+      g.mixedVsAmmBps.toFixed(2),
+      String(g.levelsUsed),
+      g.transferRate.toFixed(9),
+      g.ammFeeBp.toFixed(2),
+      streak.firstSeen,
+      streak.lastSeen,
+      String(streak.ticks),
+      String(tickIntervalMs),
+    ]
+      .map(csvField)
+      .join(",");
+
+    appendFileSync(
+      path,
+      (isNew ? BOOK_COLUMNS.join(",") + "\n" : "") + line + "\n",
+      "utf8",
+    );
+  } catch (e: any) {
+    console.error("book csv log failed:", e?.message ?? e);
+  }
+}
+
+/**
+ * Apply one tick's book outcomes to the streaks and write the rows.
+ *
+ * Every direction of every pair that was READ gets exactly one event:
+ * qualifying extends its run, not qualifying ends it. Pairs that were not read
+ * are absent from `outcomes` and get no event, which is the whole of the
+ * "silence is neither" rule on ObservedStreakTracker. Shared by monitor.ts and
+ * the test suite, so the rule tested is the rule that runs.
+ */
+export function recordBookOutcomes(
+  tracker: ObservedStreakTracker,
+  outcomes: readonly BookOutcome[],
+  at: Date,
+  tickIntervalMs: number,
+  path: string = BOOK_LOG_PATH,
+): void {
+  for (const o of outcomes) {
+    let rowStreak: Streak | null = null;
+    for (const d of BOOK_DIRECTIONS) {
+      const key = bookStreakKey(o.pairKey, d);
+      if (o.qualifying.includes(d)) {
+        const s = tracker.mark(key, at);
+        if (o.row?.direction === d) rowStreak = s;
+      } else {
+        tracker.miss(key);
+      }
+    }
+    if (o.row && rowStreak) logBookGap(o.row, rowStreak, at, tickIntervalMs, path);
   }
 }
 

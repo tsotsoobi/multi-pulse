@@ -30,9 +30,9 @@ The claim is that nothing imports them and nothing calls them:
 - `Client` is the only binding imported from `xrpl` anywhere under `src/`. Response
   shapes are declared locally rather than imported, so no transaction type is ever
   pulled into scope.
-- The only rippled commands issued at runtime are `server_info`, `ledger` and
-  `amm_info`. The offline scripts additionally use `ledger_data` and `account_info`.
-  All five are ledger reads. `submit` is a rippled command name reachable through the
+- The only rippled commands issued at runtime are `server_info`, `ledger`, `amm_info`,
+  `book_offers` and `account_info` (the last two for the order-book observation only).
+  The offline scripts additionally use `ledger_data`. All six are ledger reads. `submit` is a rippled command name reachable through the
   same `Client.request()` this code does use, so the command literals are constrained
   as tightly as the imports.
 
@@ -237,6 +237,27 @@ endpoint returning 503 is not evidence about the market.
 `size`, `output`, `fee_native` and `net_profit` are in the row's own venue's native asset:
 XLM for `stellar`, XRP for `xrpl`, ETH for `base`. They must not be summed or compared
 across venues without converting them first.
+
+### XRPL order-book observation
+
+On XRPL the monitor also reads both order books of the 10 deepest XRP pairs each tick,
+pinned to the same ledger as that tick's AMM reads, and prices four round trips per rung:
+AMM only, book only, book then AMM, and AMM then book. This is observation only: nothing
+here reaches the opportunity search or `data/opportunities.csv`. A row is appended to
+`data/book-gaps.csv` (also gitignored) only when a mixed cycle clears the same floors as
+the AMM search, at most one row per pair per tick:
+
+```
+timestamp, ledger, pair_key, pair_label, direction, rung, amm_out, book_out,
+book_then_amm_out, amm_then_book_out, fee_native, net_profit, best_gap_bps,
+mixed_vs_amm_bps, levels_used, transfer_rate, amm_fee_bp, first_seen, last_seen,
+streak_ticks, tick_interval_ms
+```
+
+Book streaks count observed ticks only: a tick in which a pair was not read neither
+extends nor resets its streak. The XRPL heartbeat carries `books`, `book_errors`,
+`amm_in_book`, `book_capped`, `book_skipped` and `book_ms`. The pre-registered
+hypothesis is in [FINDINGS.md](FINDINGS.md) section 8.
 
 ## Findings
 
