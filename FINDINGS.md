@@ -466,3 +466,85 @@ logged run. A 10x larger probe scales the output by about 9.991.
 cbBTC/AERO holds roughly 0.0074 cbBTC and would need a probe of about 1/18 of its reserve
 to resolve 0.01%. It stays dropped, which is also the right outcome for a pool that small.
 The next run will confirm or correct these estimates.
+
+## 7. 18 to 19 September 2026: first full run with Base
+
+All three venues, Stellar, XRPL and Base, ran together in one process. The figures below
+are measured from `data/opportunities.csv`, rows from `2026-09-18T09:26:33Z` to
+`2026-09-19T15:01:53Z`.
+
+### 7.1 Coverage
+
+**The run spans 29.6 hours, of which about 9 were unobserved.** Every gap over 2 minutes
+affects all venues together, and all of them fall inside the same process; none is a
+restart:
+
+| Gap | Length |
+|---|---|
+| 17:43 to 20:18 on 18 September | 9,312 s |
+| 23:03 on 18 September to 03:30 on 19 September | 15,984 s |
+| 10:50 to 11:48 on 19 September | 3,450 s |
+| 14 shorter gaps | 121 to 1,827 s each |
+
+**Cause: the laptop lost mains power and slept on battery.** The Windows System event log
+shows repeated "power source change" events, followed by sleep on battery: Modern Standby
+on idle timeout at 22:47, hibernation from 23:17 to 03:30, and a critical-battery sleep
+from 10:51 to 11:48. Whether the power losses were grid outages or an unplugged charger
+was not determined. The sleep-never setting evidently applied to mains power only.
+
+### 7.2 Errors
+
+Error rows over all tick rows, per venue:
+
+| Venue | Errors | Share | Breakdown |
+|---|---|---|---|
+| stellar | 175 / 1,217 | 14.4% | 130 "operation aborted due to timeout", 44 "fetch failed", 1 "terminated" |
+| xrpl | 60 / 1,217 | 4.9% | 41 "getaddrinfo ENOTFOUND", 11 connect timeouts, 6 "Websocket connection never cleaned up", 1 closed before connecting, 1 "server too busy" |
+| base | 98 / 1,217 | 8.1% | 84 "fetch failed", 14 "tick exceeded 15000 ms" |
+
+**Zero "over rate limit" errors on Base.** The Multicall3 design in section 6.1 held for
+the whole run.
+
+**Every error type is a connectivity failure.** The DNS failures in particular are
+consistent with the network itself going down, likely with the same power losses. No
+error points at venue code.
+
+### 7.3 Base behaviour
+
+**Start-up and pool set were stable.** Every successful Base tick verified all 4 tokens
+with exactly 1 expected drop (Aerodrome cbBTC/AERO, unresolvable quote, as predicted in
+section 6.2). No token or pool dropped out mid-run.
+
+**Zero Base routes** in about 20 hours of actual observation over 8 searchable pools (10
+priced, 2 of them below the 5 ETH depth floor). No cycle among WETH, USDC, cbBTC and AERO
+on Uniswap V2 or Aerodrome volatile pools cleared `BASE_FEE_NATIVE` plus the 20 bp floor.
+
+**This zero has a known limit.** `BASE_FEE_NATIVE` was set as a deliberate overestimate:
+it assumes a gas price of 0.1 gwei, where basescan showed about 0.005 gwei on 18
+September. An edge larger than the true cost but smaller than that assumption would not
+have been reported. This is a limit of the result, not a finding of edges.
+
+### 7.4 Loop timing
+
+Intervals between ticks, counting only those under 120 s so that the gaps in 7.1 are
+excluded:
+
+| Venue | Median | 90th percentile |
+|---|---|---|
+| stellar | 60,007 ms | 60,015 ms |
+| xrpl | 59,997 ms | 78,134 ms |
+| base | 60,034 ms | 80,999 ms |
+
+The loop holds `POLL_MS` at the median with all three venues in it. The longer tail on
+XRPL and Base follows passes stretched by network timeouts earlier in the same pass.
+
+### 7.5 Other venues in the same window
+
+Stellar logged 23 triangular rows and XRPL 2 in this window. They have not yet been
+examined, and nothing is claimed about them here.
+
+### 7.6 Conclusion
+
+The Base module is operationally sound and was merged into `main` on 19 September 2026.
+The measurement's main weakness is environmental: power and network. Any future run
+intended as evidence needs mains power and network continuity addressed first.
