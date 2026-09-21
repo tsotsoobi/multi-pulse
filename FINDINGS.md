@@ -605,4 +605,32 @@ mostly single-tick sightings at small rungs.
 
 ### 8.4 Results
 
-To be added after the run.
+#### Interim status, 21 September 2026 (not a verdict)
+
+Measured from `data/opportunities.csv`, XRPL heartbeats from 2026-09-19T16:28:01Z to
+2026-09-21T16:52:38Z.
+
+- **Heartbeats.** 1,735 heartbeats, 1,685 with books read.
+- **Observed time.** 29.0 observed hours of the 48 required, summing `tick_interval_ms`
+  over ticks with books read and an interval under 120 s. Grid power outages account for
+  most of the difference from calendar time.
+- **Book-gap rows.** 0.
+- **Double count.** `amm_in_book`: 0 in total.
+- **Capped walks.** `book_capped`: 0 in total.
+- **Read time.** `book_ms`: median 9,692 ms, p90 15,542 ms, 103 ticks over 20 s.
+
+The run continues until 48 observed hours. The verdict will be added then, under the
+criteria in 8.3.
+
+### 8.5 A gap in the criteria, noted before the verdict
+
+The supported criterion in 8.3 (at least 90% of rows with `streak_ticks` = 1) presumes at
+least some rows. It does not cover a zero-row outcome. This is recorded here, before the
+run completes and without changing 8.3.
+
+If the run ends with zero rows, the verdict will be stated as: consistent with the
+hypothesis on rarity; the "short-lived" part untestable, because no gap occurred whose
+duration could be measured; the 8.3 criteria did not anticipate this outcome.
+
+A further limitation: rows are written only when a mixed cycle clears the floors, so the
+data cannot show how close sub-floor gaps came.
