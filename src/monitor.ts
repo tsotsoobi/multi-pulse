@@ -12,16 +12,19 @@ import {
   type VenueName,
 } from "./config.js";
 import {
+  BOOK_LOG_PATH,
   LOG_PATH,
+  ObservedStreakTracker,
   StreakTracker,
   logHeartbeat,
   logOpportunity,
+  recordBookOutcomes,
   type Streak,
 } from "./logger.js";
 import { StellarVenue } from "./venues/stellar.js";
-import { XrplVenue } from "./venues/xrpl.js";
+import { XrplVenue, type BookObservation } from "./venues/xrpl.js";
 import { BaseVenue } from "./venues/base.js";
-import type { Venue } from "./venue.js";
+import type { Pool, Venue } from "./venue.js";
 
 /**
  * The poll loop: fetch, detect, log, print. That is the entire program.
@@ -152,6 +155,17 @@ async function tick(): Promise<void> {
         logOpportunity(op, streak, at, intervalMs);
       }
 
+      // After the AMM search has run and been logged, on the same pools, so
+      // nothing the observation does can reach findOpportunities or the main
+      // CSV. Its time is reported as book_ms rather than folded into tick_ms,
+      // which keeps meaning what it meant before.
+      let bookNote = "";
+      if (hasBooks(venue)) {
+        const bookStarted = Date.now();
+        await observeBooks(venue, pools, limits, at, intervalMs);
+        bookNote = ` book_ms=${Date.now() - bookStarted}`;
+      }
+
       // `pools` is what the venue saw; `searched` is what the graph was built
       // from. Reporting these, always -- including zeros -- is the point: a
       // reader comparing venues has to be able to see how much of one venue's
@@ -168,7 +182,8 @@ async function tick(): Promise<void> {
         ` shallow=${shallow.length} routes=${ops.length}` +
         ` streaks=${tracker.activeCount}` +
         ` tick_ms=${elapsed} interval_ms=${intervalMs}` +
-        fetchNote(venue);
+        fetchNote(venue) +
+        bookNote;
 
       // Written whatever happened, including ops.length === 0. Without this
       // row a quiet market and a dead process produce the same empty file.
@@ -271,6 +286,63 @@ interface LifecycleVenue {
   stop(): Promise<void>;
 }
 
+/**
+ * A venue that also observes order books next to its AMM. XRPL only, and
+ * optional for the same reason as the interfaces above: it is not part of the
+ * Venue contract, and nothing it produces reaches findOpportunities.
+ */
+interface BookObservingVenue {
+  observeBooks(pools: Pool[], limits: SearchLimits): Promise<BookObservation>;
+}
+
+function hasBooks(v: Venue): v is Venue & BookObservingVenue {
+  return typeof (v as Partial<BookObservingVenue>).observeBooks === "function";
+}
+
+/**
+ * Book streaks, one tracker per venue, separate from the route trackers. See
+ * ObservedStreakTracker for why a tick without book data leaves them alone.
+ */
+const bookTrackers = new Map<string, ObservedStreakTracker>();
+
+/**
+ * Run one book observation and log it. Never throws: a book failure is counted
+ * in the venue's own heartbeat fields and must not fail the AMM tick, whose
+ * rows are already written by the time this runs.
+ */
+async function observeBooks(
+  venue: Venue & BookObservingVenue,
+  pools: Pool[],
+  limits: SearchLimits,
+  at: Date,
+  intervalMs: number,
+): Promise<void> {
+  let tracker = bookTrackers.get(venue.name);
+  if (!tracker) {
+    tracker = new ObservedStreakTracker();
+    bookTrackers.set(venue.name, tracker);
+  }
+
+  try {
+    const { reselected, outcomes } = await venue.observeBooks(pools, limits);
+
+    if (reselected) {
+      console.log(
+        `[${stamp(at)}] ${venue.name} book pairs (${reselected.length}): ` +
+          reselected
+            .map((p) => `${venue.assetLabel(p.counterKey)}=${Math.round(p.nativeReserve)}`)
+            .join(" "),
+      );
+    }
+
+    recordBookOutcomes(tracker, outcomes, at, intervalMs);
+  } catch (e: any) {
+    console.error(
+      `[${stamp(new Date())}] ${venue.name} book observation failed: ${e?.message ?? e}`,
+    );
+  }
+}
+
 function hasLifecycle(v: Venue): v is Venue & LifecycleVenue {
   const c = v as Partial<LifecycleVenue>;
   return typeof c.start === "function" && typeof c.stop === "function";
@@ -305,6 +377,10 @@ async function main(): Promise<void> {
     `multi-pulse: observing ${VENUES.map(({ venue }) => venue.name).join(", ")}`,
   );
   console.log(`poll=${POLL_MS}ms  log=${LOG_PATH}`);
+  if (VENUES.some(({ venue }) => hasBooks(venue))) {
+    // The pairs themselves are printed on the first tick, once pools exist.
+    console.log(`books=${BOOK_LOG_PATH}`);
+  }
   console.log("read-only: this process cannot sign or submit anything\n");
 
   // Before the loop, not inside it. A venue that reads a network constant at

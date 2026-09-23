@@ -548,3 +548,131 @@ examined, and nothing is claimed about them here.
 The Base module is operationally sound and was merged into `main` on 19 September 2026.
 The measurement's main weakness is environmental: power and network. Any future run
 intended as evidence needs mains power and network continuity addressed first.
+
+## 8. XRPL order books next to the AMM: pre-registered hypothesis
+
+Written on 19 September 2026, before any run of the order-book observation. Nothing in
+this section is a result. Results will be added below after the run, and this text will
+not be edited to fit them.
+
+### 8.1 Hypothesis
+
+XRPL interleaves AMM and order-book liquidity in every payment and every offer, and
+auction-slot holders trade against the AMM at a reduced or zero fee. Therefore gaps
+between the order book and the AMM that clear the fee floor will be rare and short-lived:
+mostly single-tick sightings at small rungs.
+
+### 8.2 What is measured
+
+- **Pairs.** The 10 deepest XRP pools that pass the 1,000 XRP depth floor, ranked by XRP
+  reserve, one per counter-asset. The selection is recomputed every 30 XRPL ticks (about
+  30 minutes) and printed to the console on each selection.
+- **Reads.** Both order books of each pair, 20 `book_offers` per tick, pinned to the same
+  ledger as that tick's `amm_info` reads. Each issuer's `TransferRate` is read with
+  `account_info` on each selection. If that read fails, it is retried on each following
+  tick, one `account_info` per missing issuer, until it succeeds; meanwhile that issuer's
+  pairs are skipped. A tick with every rate known makes no `account_info` call.
+- **Cycles.** At each rung of the XRPL ladder (0.1 to 100 XRP), four round trips from XRP
+  back to XRP: AMM only, book only, book then AMM, AMM then book. Books are walked level by
+  level using funded amounts. A rung the book cannot fill has no book figure, never a
+  mid-price stand-in.
+- **The mixed figures are lower bounds.** The payment engine blends AMM and book within a
+  single hop. These cycles use one venue per hop, so the engine would do at least as well.
+- **Costs.** The AMM's full `trading_fee` (not an auction-slot discount), the same flat
+  network fee as the AMM search, and the issuer's transfer fee charged once per cycle on
+  the hop that spends the token, for book and AMM legs alike. Whether the transfer fee
+  applies when the AMM is the counterparty is unverified; it is charged regardless.
+- **Double count.** Offers whose `Account` is the pair's own AMM account are counted
+  (`amm_in_book`) and excluded from the walk.
+- **Rows.** One row in `data/book-gaps.csv` per pair per tick, only when a mixed cycle
+  clears the AMM search's floors (net profit of at least 0.001 XRP and 20 bps after the
+  network fee), at the qualifying rung and direction with the largest net profit.
+- **Streaks count observed ticks only.** A tick in which a pair was not read (failed read,
+  no pinned ledger, missing pool or transfer rate) neither extends nor resets its streak.
+  Only a pinned tick in which the pair was read and did not qualify resets it. Such ticks
+  are counted per tick as `book_skipped` in the heartbeat.
+
+### 8.3 Verdict criteria, fixed now
+
+- **Mid-ladder** means rungs from 5 to 40 XRP.
+- **Refuted** if any pair and direction shows a run of 3 or more consecutive observed ticks
+  at a mid-ladder rung, on 3 or more occasions separated by at least 1 hour.
+- **Supported** if at least 90% of rows have `streak_ticks` = 1, with the remainder
+  described.
+- **Neither** otherwise.
+- **No verdict either way from less than 48 hours of actual observation.** Gaps in
+  collection and failed ticks are excluded from that total.
+
+### 8.4 Results
+
+#### Interim status, 21 September 2026 (not a verdict)
+
+Measured from `data/opportunities.csv`, XRPL heartbeats from 2026-09-19T16:28:01Z to
+2026-09-21T16:52:38Z.
+
+- **Heartbeats.** 1,735 heartbeats, 1,685 with books read.
+- **Observed time.** 29.0 observed hours of the 48 required, summing `tick_interval_ms`
+  over ticks with books read and an interval under 120 s. Grid power outages account for
+  most of the difference from calendar time.
+- **Book-gap rows.** 0.
+- **Double count.** `amm_in_book`: 0 in total.
+- **Capped walks.** `book_capped`: 0 in total.
+- **Read time.** `book_ms`: median 9,692 ms, p90 15,542 ms, 103 ticks over 20 s.
+
+The run continues until 48 observed hours. The verdict will be added then, under the
+criteria in 8.3.
+
+#### Verdict, 23 September 2026
+
+Measured from `data/opportunities.csv`, XRPL heartbeats from 2026-09-19T16:28:01Z to
+2026-09-23T13:19:51Z.
+
+- **Heartbeats.** 3,142 heartbeats, 3,058 with books read.
+- **Observed time.** 52.2 observed hours, above the 48 required, summing
+  `tick_interval_ms` over XRPL heartbeats where books were read and the interval was under
+  120 s, so gaps in collection and failed ticks are excluded. The calendar span is
+  longer because of grid power outages and one machine hibernation on 22 September that
+  stopped both monitors.
+- **Book-gap rows.** 0.
+- **Double count.** `amm_in_book`: 0 in total.
+- **Capped walks.** `book_capped`: 0 in total.
+- **Read time.** `book_ms`: median 9,575 ms, p90 15,099 ms, 163 ticks over 20 s.
+
+Verdict under the 8.3 criteria, which were fixed before the run:
+
+- **Rarity: satisfied, in the strongest form.** No mixed cycle cleared the floors once in
+  52.2 observed hours across 10 pairs.
+- **Short-lived: not testable.** No gap occurred whose duration could be measured.
+- **The 90%-of-rows criterion does not apply.** With zero rows there is no share of rows
+  to compute. 8.5 anticipated this outcome and stated this wording in advance.
+- **Refutation did not occur.** No pair and direction showed 3 or more consecutive
+  observed ticks at a mid-ladder rung.
+
+Secondary results:
+
+- **No AMM offers in the books.** XRPL order books never contained the pair's own AMM
+  account as an offer: `amm_in_book` was 0 throughout.
+- **No truncated replies.** No `book_offers` reply was truncated at the 200-offer limit.
+
+Limits on the result:
+
+- **Sub-floor gaps are invisible.** Rows are written only when a mixed cycle clears the
+  floors, so the data cannot show how close sub-floor gaps came.
+- **Coverage.** The measurement covers the 10 deepest XRP pairs, not every pair.
+
+Interpretation, not measurement: the result is consistent with the design of XLS-30, in
+which the payment engine blends AMM and order-book liquidity within a hop and
+auction-slot holders can arbitrage the difference at a reduced or zero fee.
+
+### 8.5 A gap in the criteria, noted before the verdict
+
+The supported criterion in 8.3 (at least 90% of rows with `streak_ticks` = 1) presumes at
+least some rows. It does not cover a zero-row outcome. This is recorded here, before the
+run completes and without changing 8.3.
+
+If the run ends with zero rows, the verdict will be stated as: consistent with the
+hypothesis on rarity; the "short-lived" part untestable, because no gap occurred whose
+duration could be measured; the 8.3 criteria did not anticipate this outcome.
+
+A further limitation: rows are written only when a mixed cycle clears the floors, so the
+data cannot show how close sub-floor gaps came.

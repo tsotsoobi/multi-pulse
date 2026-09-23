@@ -541,6 +541,37 @@ export const XRPL_DISCOVERY_BATCH = 150;
  */
 export const XRPL_NEGATIVE_RECHECK_MS = 30 * 60_000;
 
+/**
+ * Pairs whose order books are observed next to their AMM, per tick.
+ *
+ * OBSERVATION ONLY. The book figures go to data/book-gaps.csv and nowhere else;
+ * findOpportunities never sees a book. Each selected pair costs two book_offers
+ * per tick (one per direction), so this is also the request budget: 2 x 10 = 20
+ * extra reads per XRPL tick. See XrplVenue.observeBooks and FINDINGS.md
+ * section 8.
+ */
+export const XRPL_BOOK_PAIRS = 10;
+
+/**
+ * How often, in XRPL ticks, the observed pairs are reselected by depth and
+ * their issuers' TransferRate re-read with account_info.
+ *
+ * 30 ticks is about 30 minutes at POLL_MS, the same cadence at which pool
+ * discovery refreshes (XRPL_NEGATIVE_RECHECK_MS). Between reselections the pair
+ * set and every transfer rate already read are held fixed, so rows in that
+ * window are comparable with each other. A rate whose read failed is retried
+ * each tick until it succeeds; see XrplVenue.observeBooks.
+ */
+export const XRPL_BOOK_RESELECT_TICKS = 30;
+
+/**
+ * `limit` sent with each book_offers. A public node may clamp it lower; a walk
+ * that runs out on a reply of exactly this many offers is counted as
+ * book_capped in the heartbeat, because "the book is thin" and "the page was
+ * cut" would otherwise look the same.
+ */
+export const XRPL_BOOK_OFFERS_LIMIT = 200;
+
 /** One issued currency on XRPL, as the pair-probe asks about it. */
 export interface SeedToken {
   /** Currency code exactly as the ledger stores it: 3-char ASCII, or 40 hex. */

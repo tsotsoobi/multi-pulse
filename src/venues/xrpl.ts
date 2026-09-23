@@ -1,7 +1,11 @@
 import { Client } from "xrpl";
 
+import type { SearchLimits } from "../arb.js";
 import {
   XRPL_BASE_FEE_DROPS,
+  XRPL_BOOK_OFFERS_LIMIT,
+  XRPL_BOOK_PAIRS,
+  XRPL_BOOK_RESELECT_TICKS,
   XRPL_DISCOVERY_BATCH,
   XRPL_FEE_SAFETY_MULTIPLIER,
   XRPL_NEGATIVE_RECHECK_MS,
@@ -11,7 +15,16 @@ import {
   XRPL_WS_URL,
   type SeedToken,
 } from "../config.js";
-import type { Pool, Venue } from "../venue.js";
+import { other, type Pool, type Venue } from "../venue.js";
+import {
+  pickGapRow,
+  priceRung,
+  selectBookPairs,
+  transferRateOf,
+  type BookLevel,
+  type BookOutcome,
+  type BookPair,
+} from "./xrpl-books.js";
 
 /**
  * XRPL mainnet, read through rippled's public API.
@@ -28,10 +41,12 @@ import type { Pool, Venue } from "../venue.js";
  *   1. `Client` is the only binding imported from `xrpl` anywhere under src/.
  *      Response shapes are declared locally, below, rather than imported, so
  *      that no transaction type is ever pulled into scope.
- *   2. The only rippled commands issued are `server_info`, `ledger` and
- *      `amm_info`. All three are ledger reads. `submit` is a rippled command
- *      name too, reachable through the same Client.request() we do use, so the
- *      command literals are checked as tightly as the imports.
+ *   2. The only rippled commands issued are `server_info`, `ledger`,
+ *      `amm_info`, `book_offers` and `account_info`. All five are ledger reads.
+ *      The last two serve the order-book observation (observeBooks) only.
+ *      `submit` is a rippled command name too, reachable through the same
+ *      Client.request() we do use, so the command literals are checked as
+ *      tightly as the imports.
  *
  * Both are asserted by test/check.ts against the source text. See the
  * read-only property block there -- that test, not this comment, is what makes
@@ -96,6 +111,43 @@ export interface XrplFetchStats {
   ledgerIndex: number;
 }
 
+/**
+ * The slice of Client this module uses. Typed off Client itself, so the only
+ * binding taken from `xrpl` is still `Client`; it exists so test/check.ts can
+ * hand the venue a counting fake instead of a socket.
+ */
+export type RippledClient = Pick<
+  Client,
+  "request" | "isConnected" | "connect" | "disconnect"
+>;
+
+/** What the last observeBooks() did, for the heartbeat. */
+export interface XrplBookStats {
+  /** Pairs currently selected for observation. */
+  pairs: number;
+  /** book_offers replies received and parsed this tick. */
+  books: number;
+  /** book_offers and account_info reads that failed this tick. */
+  errors: number;
+  /** Offers owned by the pair's own AMM account, counted and excluded. */
+  ammInBook: number;
+  /** Book walks that ran out on a reply holding exactly the offer limit. */
+  capped: number;
+  /**
+   * Selected pairs not observed this tick: no pinned ledger, no pool, no
+   * transfer rate, or a failed read.
+   */
+  skipped: number;
+}
+
+/** What observeBooks() hands the monitor. */
+export interface BookObservation {
+  /** The new selection on a reselection tick, for the console; null otherwise. */
+  reselected: BookPair[] | null;
+  /** One entry per pair actually read this tick. Skipped pairs are absent. */
+  outcomes: BookOutcome[];
+}
+
 export class XrplVenue implements Venue {
   readonly name = "xrpl";
   readonly nativeKey = NATIVE;
@@ -136,17 +188,43 @@ export class XrplVenue implements Venue {
    */
   readonly droppedSeeds: DroppedSeed[];
 
-  private client: Client | null = null;
+  lastBooks: XrplBookStats = {
+    pairs: 0,
+    books: 0,
+    errors: 0,
+    ammInBook: 0,
+    capped: 0,
+    skipped: 0,
+  };
+
+  private client: RippledClient | null = null;
   private readonly candidates: Candidate[];
   private readonly cache = new Map<string, CacheEntry>();
 
   /** Rotating cursor into `candidates`, so discovery sweeps the whole set. */
   private discoveryCursor = 0;
 
-  constructor(seeds: readonly SeedToken[] = XRPL_SEED_TOKENS) {
+  /** Pairs whose books are read each tick. Replaced on reselection only. */
+  private bookPairs: BookPair[] = [];
+
+  /**
+   * TransferRate per issuer, read on reselection. A missing entry means the
+   * read failed or the field was malformed; that issuer's pairs are skipped
+   * rather than priced against a guess, and the read is retried next tick.
+   */
+  private transferRates = new Map<string, number>();
+
+  /** observeBooks() calls so far; reselection runs when this is 0 mod K. */
+  private bookTicks = 0;
+
+  constructor(
+    seeds: readonly SeedToken[] = XRPL_SEED_TOKENS,
+    opts: { client?: RippledClient } = {},
+  ) {
     const { dropped } = classifySeeds(seeds);
     this.droppedSeeds = dropped;
     this.candidates = buildCandidates(seeds);
+    this.client = opts.client ?? null;
   }
 
   /**
@@ -299,6 +377,198 @@ export class XrplVenue implements Venue {
   }
 
   /**
+   * Read and price the order books of the selected pairs. OBSERVATION ONLY.
+   *
+   * Called by the monitor after fetchPools() and findOpportunities(), with the
+   * same pools: nothing here can change what the AMM search saw. The results go
+   * to data/book-gaps.csv only.
+   *
+   * BUDGET. Exactly two book_offers per observed pair, one per direction, all
+   * pinned to the ledger index this tick's amm_info reads were pinned to, so a
+   * book and its AMM are read at the same ledger. Plus one account_info per
+   * selected issuer whose TransferRate is unknown: every issuer on a
+   * reselection tick (the first call, then every XRPL_BOOK_RESELECT_TICKS),
+   * and on other ticks only issuers whose earlier read failed. Nothing else.
+   *
+   * SKIPS. With no pinned ledger there is nothing to pin the books to, so no
+   * books are read at all. A pair whose pool is missing this tick, whose
+   * issuer's rate is unknown, or one of whose two reads failed is skipped too.
+   * Skipped pairs are counted in book_skipped and are absent from `outcomes`,
+   * which is what keeps a hole in the data from reading as a gap that closed.
+   *
+   * DOUBLE COUNT. It is unverified whether book_offers can return the AMM's
+   * own liquidity. Any offer whose Account is the pair's AMM account is
+   * counted (amm_in_book) and excluded from the walk, so the AMM is never
+   * priced twice in one cycle.
+   */
+  async observeBooks(
+    pools: Pool[],
+    limits: SearchLimits,
+  ): Promise<BookObservation> {
+    const client = await this.connect();
+    let errors = 0;
+    let reselected: BookPair[] | null = null;
+
+    if (
+      this.bookTicks % XRPL_BOOK_RESELECT_TICKS === 0 ||
+      this.bookPairs.length === 0
+    ) {
+      this.bookPairs = selectBookPairs(
+        this,
+        pools,
+        limits.minPoolNative,
+        XRPL_BOOK_PAIRS,
+      );
+      reselected = this.bookPairs;
+      // Every rate is re-read on reselection, so none is older than K ticks.
+      this.transferRates = new Map();
+    }
+    this.bookTicks++;
+
+    // One account_info per selected issuer whose rate is unknown: all of them
+    // on a reselection tick, and on any other tick only those whose read
+    // failed before. Retried every tick rather than left until the next
+    // reselection, because a single failed read would otherwise blank that
+    // issuer's pairs for up to K ticks. With every rate known this is empty,
+    // and an ordinary tick issues no account_info at all.
+    const missing = [...new Set(this.bookPairs.map((p) => p.issuer))].filter(
+      (issuer) => !this.transferRates.has(issuer),
+    );
+    const rates = await mapLimit(missing, XRPL_PROBE_CONCURRENCY, (issuer) =>
+      readTransferRate(client, issuer),
+    );
+    for (let i = 0; i < missing.length; i++) {
+      const r = rates[i]!;
+      if (r === null) errors++;
+      else this.transferRates.set(missing[i]!, r);
+    }
+
+    const selected = this.bookPairs;
+    const stats: XrplBookStats = {
+      pairs: selected.length,
+      books: 0,
+      errors,
+      ammInBook: 0,
+      capped: 0,
+      skipped: 0,
+    };
+    // Set before any book read, so a throw part-way leaves "nothing observed"
+    // in the heartbeat rather than the previous tick's numbers.
+    this.lastBooks = { ...stats, skipped: selected.length };
+
+    const ledgerIndex = this.lastFetch.ledgerIndex;
+    const outcomes: BookOutcome[] = [];
+
+    if (ledgerIndex <= 0) {
+      stats.skipped = selected.length;
+      this.lastBooks = stats;
+      return { reselected, outcomes };
+    }
+
+    // This tick's pool for each counter-asset with an XRP pool.
+    const poolOf = new Map<string, Pool>();
+    for (const p of pools) {
+      if (p.a !== NATIVE && p.b !== NATIVE) continue;
+      poolOf.set(other(p, NATIVE), p);
+    }
+
+    const ready: Array<{ pair: BookPair; pool: Pool; rate: number }> = [];
+    for (const pair of selected) {
+      const pool = poolOf.get(pair.counterKey);
+      const rate = this.transferRates.get(pair.issuer);
+      if (!pool || rate === undefined) stats.skipped++;
+      else ready.push({ pair, pool, rate });
+    }
+
+    const xrp: CurrencySpec = { currency: NATIVE };
+    const reads = ready.flatMap(({ pair }) => {
+      const t: CurrencySpec = { currency: pair.currency, issuer: pair.issuer };
+      // Even index: taker pays XRP, gets T. Odd index: taker pays T, gets XRP.
+      return [
+        { gets: t, pays: xrp },
+        { gets: xrp, pays: t },
+      ];
+    });
+    const replies = await mapLimit(reads, XRPL_PROBE_CONCURRENCY, (r) =>
+      readBook(client, r.gets, r.pays, ledgerIndex),
+    );
+
+    const ladder = limits.sizeLadder.filter((s) => s <= limits.maxSize);
+
+    for (let i = 0; i < ready.length; i++) {
+      const { pair, pool, rate } = ready[i]!;
+      const buyReply = replies[2 * i]!;
+      const sellReply = replies[2 * i + 1]!;
+      for (const r of [buyReply, sellReply]) {
+        if (r === null) errors++;
+        else stats.books++;
+      }
+      if (buyReply === null || sellReply === null) {
+        stats.skipped++;
+        continue;
+      }
+
+      const buy = splitAmmOffers(buyReply, pool.id);
+      const sell = splitAmmOffers(sellReply, pool.id);
+      stats.ammInBook += buy.ammOwned + sell.ammOwned;
+
+      const buyT = toLevels(buy.kept, pair.counterKey, NATIVE);
+      const sellT = toLevels(sell.kept, NATIVE, pair.counterKey);
+
+      const figs = ladder.map((rung) =>
+        priceRung(this, pool, buyT, sellT, rung, rate),
+      );
+
+      if (
+        buyReply.length >= XRPL_BOOK_OFFERS_LIMIT &&
+        figs.some((f) => f.bookThenAmm === null)
+      ) {
+        stats.capped++;
+      }
+      if (
+        sellReply.length >= XRPL_BOOK_OFFERS_LIMIT &&
+        figs.some((f) => f.ammThenBook === null)
+      ) {
+        stats.capped++;
+      }
+
+      const { qualifying, pick } = pickGapRow(figs, this.feeNative, limits);
+      const pairKey = `${NATIVE}/${pair.counterKey}`;
+      outcomes.push({
+        pairKey,
+        qualifying,
+        row: pick && {
+          ledger: ledgerIndex,
+          pairKey,
+          pairLabel: `XRP/${this.assetLabel(pair.counterKey)}`,
+          direction: pick.direction,
+          rung: pick.figures.rung,
+          ammOut: pick.figures.ammOut,
+          bookOut: pick.figures.bookOut,
+          bookThenAmm: pick.figures.bookThenAmm,
+          ammThenBook: pick.figures.ammThenBook,
+          feeNative: this.feeNative,
+          netProfit: pick.netProfit,
+          netBps: pick.netBps,
+          mixedVsAmmBps: pick.mixedVsAmmBps,
+          levelsUsed: pick.levelsUsed,
+          transferRate: rate,
+          ammFeeBp: pool.feeBp,
+        },
+      });
+    }
+
+    stats.errors = errors;
+    this.lastBooks = stats;
+    return { reselected, outcomes };
+  }
+
+  /** Selected pairs, for the startup and reselection console line. */
+  get selectedBookPairs(): readonly BookPair[] {
+    return this.bookPairs;
+  }
+
+  /**
    * Constant product with the pool's OWN trading_fee, converted to bp in
    * toPool(). There is no fee constant in this function and must not be one:
    * XLS-30 pools are voted on by their LPs and sit anywhere from 0 to 1%, which
@@ -346,6 +616,7 @@ export class XrplVenue implements Venue {
   /** Heartbeat fragment. Reports the two numbers the probe budget turns on. */
   fetchNote(): string {
     const f = this.lastFetch;
+    const b = this.lastBooks;
     return (
       ` pairs=${f.pairs} probed=${f.probed} live=${f.live}` +
       ` absent=${f.absent} unknown=${f.unknown}` +
@@ -358,7 +629,11 @@ export class XrplVenue implements Venue {
       (this.droppedSeeds.length > 0
         ? ` SEEDS_DROPPED=${this.droppedSeeds.length}`
         : "") +
-      (this.feeIsLive ? "" : " FEE_FALLBACK")
+      (this.feeIsLive ? "" : " FEE_FALLBACK") +
+      // Always printed, zeros included: a count that appears only when nonzero
+      // makes its own absence ambiguous.
+      ` books=${b.books} book_errors=${b.errors} amm_in_book=${b.ammInBook}` +
+      ` book_capped=${b.capped} book_skipped=${b.skipped}`
     );
   }
 
@@ -415,7 +690,7 @@ export class XrplVenue implements Venue {
     };
   }
 
-  private async connect(): Promise<Client> {
+  private async connect(): Promise<RippledClient> {
     if (this.client?.isConnected()) return this.client;
     const client = this.client ?? new Client(XRPL_WS_URL, {
       timeout: XRPL_TIMEOUT_MS,
@@ -459,6 +734,24 @@ interface LedgerReply {
   result?: { ledger_index?: unknown };
 }
 
+/** One offer from book_offers. Only the fields the walk reads. */
+export interface WireOffer {
+  Account?: unknown;
+  TakerGets?: WireAmount;
+  TakerPays?: WireAmount;
+  /** Present only when the owner cannot fund the whole offer. */
+  taker_gets_funded?: WireAmount;
+  taker_pays_funded?: WireAmount;
+}
+
+interface BookOffersReply {
+  result?: { offers?: unknown };
+}
+
+interface AccountInfoReply {
+  result?: { account_data?: { TransferRate?: unknown } };
+}
+
 /**
  * One read-only rippled call.
  *
@@ -472,7 +765,7 @@ interface LedgerReply {
  * not close again.
  */
 async function request<T>(
-  client: Client,
+  client: RippledClient,
   req: Record<string, unknown>,
 ): Promise<T> {
   return (await client.request(req as never)) as T;
@@ -495,7 +788,7 @@ type ProbeResult =
  * probe_errors rather than as silence.
  */
 async function probe(
-  client: Client,
+  client: RippledClient,
   c: Candidate,
   ledgerIndex: number,
 ): Promise<ProbeResult> {
@@ -532,7 +825,7 @@ async function probe(
  * whatever rippled considers current. The tick still runs; fetchNote() prints
  * ledger=unpinned so the weaker snapshot is visible rather than assumed.
  */
-async function currentLedgerIndex(client: Client): Promise<number> {
+async function currentLedgerIndex(client: RippledClient): Promise<number> {
   try {
     const reply = await request<LedgerReply>(client, {
       command: "ledger",
@@ -543,6 +836,115 @@ async function currentLedgerIndex(client: Client): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+/**
+ * One side of one order book at a pinned ledger, or null if the read failed.
+ *
+ * `gets` is what the taker receives and `pays` what the taker spends, in
+ * rippled's taker_gets / taker_pays sense. No `taker` is sent, so no account's
+ * own offers are hidden from the reply.
+ */
+async function readBook(
+  client: RippledClient,
+  gets: CurrencySpec,
+  pays: CurrencySpec,
+  ledgerIndex: number,
+): Promise<WireOffer[] | null> {
+  try {
+    const reply = await request<BookOffersReply>(client, {
+      command: "book_offers",
+      taker_gets: gets,
+      taker_pays: pays,
+      ledger_index: ledgerIndex,
+      limit: XRPL_BOOK_OFFERS_LIMIT,
+    });
+    const offers = reply?.result?.offers;
+    return Array.isArray(offers) ? (offers as WireOffer[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An issuer's TransferRate as a multiplier, or null if it could not be read.
+ *
+ * Read against the latest validated ledger rather than a tick's pinned one: it
+ * is read on reselection, and retried on later ticks only if that read failed.
+ */
+async function readTransferRate(
+  client: RippledClient,
+  issuer: string,
+): Promise<number | null> {
+  try {
+    const reply = await request<AccountInfoReply>(client, {
+      command: "account_info",
+      account: issuer,
+      ledger_index: "validated",
+    });
+    const data = reply?.result?.account_data;
+    if (!data || typeof data !== "object") return null;
+    return transferRateOf(data.TransferRate);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remove offers owned by the pair's own AMM account, and count them.
+ *
+ * If book_offers ever returns the AMM's liquidity as offers, walking them as
+ * well as simulating the AMM would price the same reserves twice. The count is
+ * reported as amm_in_book; the exclusion is unconditional, and does nothing
+ * while that count is 0.
+ */
+export function splitAmmOffers(
+  offers: readonly WireOffer[],
+  ammAccount: string,
+): { kept: WireOffer[]; ammOwned: number } {
+  const kept: WireOffer[] = [];
+  let ammOwned = 0;
+  for (const o of offers) {
+    if (typeof o?.Account === "string" && o.Account === ammAccount) ammOwned++;
+    else kept.push(o);
+  }
+  return { kept, ammOwned };
+}
+
+/**
+ * One offer as a BookLevel, or null if it cannot be walked.
+ *
+ * The *_funded amounts are used when present: they are what rippled says the
+ * owner can actually deliver, and the posted amounts overstate an underfunded
+ * offer. Amounts go through parseAmount, so drops become XRP here and nowhere
+ * else. An offer whose assets are not the ones the book was asked for is
+ * dropped rather than trusted.
+ */
+export function offerToLevel(
+  o: WireOffer,
+  getsKey: string,
+  paysKey: string,
+): BookLevel | null {
+  if (typeof o?.Account !== "string") return null;
+  const gets = parseAmount(o.taker_gets_funded ?? o.TakerGets);
+  const pays = parseAmount(o.taker_pays_funded ?? o.TakerPays);
+  if (!gets || !pays) return null;
+  if (gets.key !== getsKey || pays.key !== paysKey) return null;
+  return { account: o.Account, gets: gets.units, pays: pays.units };
+}
+
+/** Every walkable offer in a reply, in reply order. */
+function toLevels(
+  offers: readonly WireOffer[],
+  getsKey: string,
+  paysKey: string,
+): BookLevel[] {
+  const out: BookLevel[] = [];
+  for (const o of offers) {
+    const l = offerToLevel(o, getsKey, paysKey);
+    if (l) out.push(l);
+  }
+  return out;
 }
 
 /** A seed that will never reach the network, and the reason it will not. */
