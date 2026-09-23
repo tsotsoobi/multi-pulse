@@ -622,6 +622,48 @@ Measured from `data/opportunities.csv`, XRPL heartbeats from 2026-09-19T16:28:01
 The run continues until 48 observed hours. The verdict will be added then, under the
 criteria in 8.3.
 
+#### Verdict, 23 September 2026
+
+Measured from `data/opportunities.csv`, XRPL heartbeats from 2026-09-19T16:28:01Z to
+2026-09-23T13:19:51Z.
+
+- **Heartbeats.** 3,142 heartbeats, 3,058 with books read.
+- **Observed time.** 52.2 observed hours, above the 48 required, summing
+  `tick_interval_ms` over XRPL heartbeats where books were read and the interval was under
+  120 s, so gaps in collection and failed ticks are excluded. The calendar span is
+  longer because of grid power outages and one machine hibernation on 22 September that
+  stopped both monitors.
+- **Book-gap rows.** 0.
+- **Double count.** `amm_in_book`: 0 in total.
+- **Capped walks.** `book_capped`: 0 in total.
+- **Read time.** `book_ms`: median 9,575 ms, p90 15,099 ms, 163 ticks over 20 s.
+
+Verdict under the 8.3 criteria, which were fixed before the run:
+
+- **Rarity: satisfied, in the strongest form.** No mixed cycle cleared the floors once in
+  52.2 observed hours across 10 pairs.
+- **Short-lived: not testable.** No gap occurred whose duration could be measured.
+- **The 90%-of-rows criterion does not apply.** With zero rows there is no share of rows
+  to compute. 8.5 anticipated this outcome and stated this wording in advance.
+- **Refutation did not occur.** No pair and direction showed 3 or more consecutive
+  observed ticks at a mid-ladder rung.
+
+Secondary results:
+
+- **No AMM offers in the books.** XRPL order books never contained the pair's own AMM
+  account as an offer: `amm_in_book` was 0 throughout.
+- **No truncated replies.** No `book_offers` reply was truncated at the 200-offer limit.
+
+Limits on the result:
+
+- **Sub-floor gaps are invisible.** Rows are written only when a mixed cycle clears the
+  floors, so the data cannot show how close sub-floor gaps came.
+- **Coverage.** The measurement covers the 10 deepest XRP pairs, not every pair.
+
+Interpretation, not measurement: the result is consistent with the design of XLS-30, in
+which the payment engine blends AMM and order-book liquidity within a hop and
+auction-slot holders can arbitrage the difference at a reduced or zero fee.
+
 ### 8.5 A gap in the criteria, noted before the verdict
 
 The supported criterion in 8.3 (at least 90% of rows with `streak_ticks` = 1) presumes at
