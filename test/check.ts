@@ -70,7 +70,30 @@ import type { Pool, Venue } from "../src/venue.js";
 import { readFileSync, readdirSync, rmSync, type Dirent } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { appendFileSync, existsSync } from "node:fs";
+import { toPool as stellarToPool } from "../src/venues/stellar.js";
+import {
+  PI_BLIND_AFTER,
+  PI_HORIZON_URL,
+  PI_SLOW_EVERY,
+  PI_WATCH_MS,
+} from "../src/config.js";
+import {
+  PI_PATHS,
+  PiWatch,
+  assetKeyOf,
+  churnSuspect,
+  diffRecords,
+  duePolls,
+  idleRequestsPerDay,
+  isEntry,
+  loadState,
+  pairOf,
+  piLabel,
+  walkAll,
+  type PiPaths,
+} from "../src/pi-watch.js";
 
 const REAL = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 const FAKE = "USDC:GBFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEX";
@@ -2030,6 +2053,546 @@ const pinnedKeys = JSON.stringify(findOpportunities(x, [
 ]).map((o) => o.routeKey));
 check("AMM route keys are byte-identical to those pinned before the book change",
   pinnedKeys === PINNED_ROUTE_KEYS, pinnedKeys);
+
+// ---------------------------------------------------------------------------
+// 14. PI MAINNET WATCHER (src/pi-watch.ts, Phase 0 of docs/pi-mainnet.md)
+//
+// Offline throughout: every request goes to a counting fake, and every file is
+// written under tmpdir(), never data/. A live watcher's files are never read,
+// written or removed by this section.
+// ---------------------------------------------------------------------------
+
+const PI_ISS = "GPIISSUERPIISSUERPIISSUERPIISSUERPIISSUERPIISSUERPIISSU";
+const piAsset = (code: string, extra: Record<string, unknown> = {}) => ({
+  asset_type: "credit_alphanum4",
+  asset_code: code,
+  asset_issuer: PI_ISS,
+  flags: { auth_required: false, auth_revocable: true },
+  ...extra,
+});
+const piKey = (code: string) => `${code}:${PI_ISS}`;
+const piPool = (id: string, a: string, b: string, feeBp = 30) => ({
+  id,
+  fee_bp: feeBp,
+  type: "constant_product",
+  total_shares: "0.0000000",
+  reserves: [{ asset: a, amount: "0.0000000" }, { asset: b, amount: "0.0000000" }],
+});
+
+interface FakePiChain {
+  assets: unknown[];
+  pools: unknown[];
+  root: Record<string, unknown>;
+  failing: Set<string>;
+  pageSize: number;
+}
+
+/**
+ * Horizon, faked: pages of `pageSize`, a `next` link on every page (including
+ * past the end, as the real one does), an empty page as the terminator.
+ */
+function fakePi(chain: FakePiChain) {
+  const calls: string[] = [];
+  const get = async (url: string): Promise<any> => {
+    calls.push(url);
+    const u = new URL(url);
+    const ep = u.pathname === "/" ? "root" : u.pathname === "/assets" ? "assets" : "pools";
+    if (chain.failing.has(ep)) throw new Error(`fake ${ep} down`);
+    if (ep === "root") return chain.root;
+    const all = ep === "assets" ? chain.assets : chain.pools;
+    const from = Number(u.searchParams.get("cursor") ?? "0");
+    const page = all.slice(from, from + chain.pageSize);
+    return {
+      _embedded: { records: page },
+      _links: { next: { href: `${u.origin}${u.pathname}?limit=200&order=asc&cursor=${from + page.length}` } },
+    };
+  };
+  const count = (path: string) =>
+    calls.filter((c) => new URL(c).pathname === path).length;
+  return { get, calls, count };
+}
+
+const PI_TMP = join(tmpdir(), `multi-pulse-check-pi-${process.pid}`);
+rmSync(PI_TMP, { recursive: true, force: true });
+let piDirs = 0;
+function piPaths(): PiPaths {
+  const d = join(PI_TMP, String(piDirs++));
+  return {
+    watch: join(d, "watch.jsonl"),
+    assets: join(d, "assets.jsonl"),
+    pools: join(d, "pools.jsonl"),
+    protocol: join(d, "protocol.jsonl"),
+    alerts: join(d, "alerts.log"),
+  };
+}
+
+function piChain(over: Partial<FakePiChain> = {}): FakePiChain {
+  return {
+    assets: [],
+    pools: [],
+    root: { current_protocol_version: 27, core_supported_protocol_version: 27, network_passphrase: "Pi Network" },
+    failing: new Set(),
+    pageSize: 200,
+    ...over,
+  };
+}
+
+/**
+ * One clock for every watcher in this section, always moving forward, so a
+ * "restarted" watcher starts later than the one before it, as a real one does.
+ */
+let piClock = Date.parse("2026-09-23T00:00:00Z");
+
+/** A watcher on scratch paths whose output lines are collected, not printed. */
+function piWatcher(paths: PiPaths, chain: FakePiChain, maxPages?: number) {
+  const fake = fakePi(chain);
+  const lines: string[] = [];
+  const w = new PiWatch({
+    paths,
+    get: fake.get,
+    now: () => new Date((piClock += 1000)),
+    out: (l) => lines.push(l),
+    ...(maxPages !== undefined ? { maxPages } : {}),
+  });
+  const alerts = () => lines.filter((l) => l.includes(" PI ALERT "));
+  return { w, fake, lines, alerts, paths };
+}
+
+const jsonl = (path: string): any[] =>
+  existsSync(path)
+    ? readFileSync(path, "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l))
+    : [];
+
+// --- Request budget -----------------------------------------------------------
+
+{
+  const r = piWatcher(piPaths(), piChain());
+  for (let i = 0; i < 144; i++) await r.w.tick();
+  const n = { assets: r.fake.count("/assets"), pools: r.fake.count("/liquidity_pools"), root: r.fake.count("/") };
+  check("pi budget while empty: 144 assets + 24 pools + 24 root = 192 a day",
+    n.assets === 144 && n.pools === 24 && n.root === 24 && r.fake.calls.length === 192,
+    JSON.stringify(n));
+  check("the banner's budget figure is the same 192", idleRequestsPerDay() === 192 &&
+    r.w.banner().some((l) => l.includes("192 requests/day")), String(idleRequestsPerDay()));
+  check("the section 3.3 inputs are the configured ones",
+    PI_WATCH_MS === 600_000 && PI_SLOW_EVERY === 6 && PI_BLIND_AFTER === 6 &&
+      PI_HORIZON_URL === "https://api.mainnet.minepi.com");
+  check("every pi request is to the Pi Horizon",
+    r.fake.calls.every((c) => new URL(c).origin === PI_HORIZON_URL));
+}
+
+{
+  // 250 assets: ceil(250/200) + 1 = 3 pages per walk, and pools every tick.
+  const assets = Array.from({ length: 250 }, (_, i) => piAsset(`T${i}`));
+  const r = piWatcher(piPaths(), piChain({ assets }));
+  for (let i = 0; i < 144; i++) await r.w.tick();
+  const n = { assets: r.fake.count("/assets"), pools: r.fake.count("/liquidity_pools"), root: r.fake.count("/") };
+  check("pi budget with 250 assets: 432 assets + 144 pools + 24 root",
+    n.assets === 432 && n.pools === 144 && n.root === 24, JSON.stringify(n));
+}
+
+{
+  // The first asset appears on tick 3, not a slow tick: pools go the same tick.
+  const chain = piChain();
+  const r = piWatcher(piPaths(), chain);
+  for (let i = 0; i < 3; i++) await r.w.tick();
+  const before = r.fake.count("/liquidity_pools");
+  chain.assets.push(piAsset("NEW"));
+  await r.w.tick();
+  check("pools are polled on the same tick the first asset appears",
+    before === 1 && r.fake.count("/liquidity_pools") === 2, `before=${before}`);
+  check("duePolls: hourly pools while empty, every tick after",
+    JSON.stringify(duePolls(0, true)) === '["pools","root"]' &&
+      JSON.stringify(duePolls(1, true)) === "[]" &&
+      JSON.stringify(duePolls(1, false)) === '["pools"]' &&
+      JSON.stringify(duePolls(6, false)) === '["pools","root"]');
+}
+
+// --- walkAll termination and origin -------------------------------------------
+
+{
+  const short = fakePi(piChain({ assets: [piAsset("A"), piAsset("B"), piAsset("C")] }));
+  const walked = await walkAll(`${PI_HORIZON_URL}/assets?limit=200&order=asc`, short.get);
+  check("a short page is not the end: the walk goes on to the empty page",
+    walked.pages === 2 && walked.records.length === 3 && !walked.truncated, JSON.stringify(walked.pages));
+
+  const throwsWith = async (fn: () => Promise<unknown>, re: RegExp) => {
+    try { await fn(); return false; } catch (e: any) { return re.test(String(e?.message)); }
+  };
+  check("a non-empty page without a next link fails the poll rather than ending it",
+    await throwsWith(() => walkAll(`${PI_HORIZON_URL}/assets`,
+      async () => ({ _embedded: { records: [piAsset("A")] }, _links: {} })), /without a next link/));
+  check("a page with no records array fails the poll rather than reading as zero",
+    await throwsWith(() => walkAll(`${PI_HORIZON_URL}/assets`,
+      async () => ({ status: 200, detail: "maintenance" })), /no _embedded.records/));
+  check("a next link to another origin is refused",
+    await throwsWith(() => walkAll(`${PI_HORIZON_URL}/assets`,
+      async () => ({ _embedded: { records: [piAsset("A")] },
+        _links: { next: { href: "https://elsewhere.example/assets?cursor=1" } } })), /another origin/));
+
+  const long = fakePi(piChain({ assets: Array.from({ length: 5 }, (_, i) => piAsset(`L${i}`)), pageSize: 1 }));
+  const capped = await walkAll(`${PI_HORIZON_URL}/assets`, long.get, 2);
+  check("the page cap marks the walk truncated", capped.truncated && capped.pages === 2 && capped.records.length === 2);
+
+  // Through the watcher: the refused link is a recorded, failed poll. The
+  // scheme differs (http), which is a different origin and just as refused.
+  const paths = piPaths();
+  const w = new PiWatch({
+    paths, out: () => {},
+    get: async (url) => new URL(url).pathname === "/"
+      ? piChain().root
+      : { _embedded: { records: [piAsset("A")] }, _links: { next: { href: "http://api.mainnet.minepi.com/assets?cursor=1" } } },
+  });
+  await w.tick();
+  const row = jsonl(paths.watch).find((l) => l.endpoint === "assets");
+  check("a refused paging link is logged as a failed poll, with its reason",
+    typeof row?.error === "string" && row.error.includes("another origin") && w.failures.assets === 1,
+    JSON.stringify(row));
+}
+
+// --- Diffing ------------------------------------------------------------------
+
+{
+  const known = new Map<string, unknown>([
+    [piKey("A"), piAsset("A")],
+    [piKey("B"), piAsset("B")],
+    [piKey("C"), piAsset("C")],
+  ]);
+  const reordered = { flags: { auth_revocable: true, auth_required: false }, asset_issuer: PI_ISS,
+    asset_code: "A", asset_type: "credit_alphanum4" };
+  const d = diffRecords(known, [reordered, piAsset("B", { amount: "5" }), piAsset("D"), { junk: 1 }], assetKeyOf);
+  check("diff: added, changed and gone are each found",
+    JSON.stringify(d.added) === JSON.stringify([piKey("D")]) &&
+      JSON.stringify(d.changed) === JSON.stringify([piKey("B")]) &&
+      JSON.stringify(d.gone) === JSON.stringify([piKey("C")]) &&
+      d.unkeyed.length === 1,
+    JSON.stringify({ a: d.added.length, c: d.changed.length, g: d.gone.length }));
+  check("diff: key order alone is not a change", !d.changed.includes(piKey("A")));
+  const ignoring = diffRecords(known, [piAsset("A", { last_modified_ledger: 9 }), piAsset("B"), piAsset("C")],
+    assetKeyOf, ["last_modified_ledger"]);
+  check("diff: an ignored field is not a change", ignoring.changed.length === 0);
+  check("pool pair keys are order-independent",
+    pairOf(piPool("x", "native", piKey("A"))) === pairOf(piPool("y", piKey("A"), "native")));
+  check("piLabel calls the native asset PI, never XLM",
+    piLabel("native") === "PI" && piLabel(piKey("ABC")) === "ABC(GPII..ISSU)", piLabel(piKey("ABC")));
+}
+
+// --- Alerts -------------------------------------------------------------------
+
+{
+  const chain = piChain();
+  const paths = piPaths();
+  const r = piWatcher(paths, chain);
+  const since = () => { const n = r.alerts().length; return () => r.alerts().slice(n); };
+
+  let mark = since();
+  await r.w.tick();
+  check("nothing alerts while Pi is empty", mark().length === 0, mark().join(" | "));
+
+  mark = since();
+  chain.assets.push(piAsset("AAA"));
+  await r.w.tick();
+  let got = mark();
+  check("the first asset alerts FIRST and NEW, with its flags",
+    got.length === 2 && got[0]!.includes("FIRST ASSET EVER SEEN") &&
+      got[1]!.includes(`NEW ASSET AAA(GPII..ISSU) ${piKey("AAA")}`) && got[1]!.includes("auth_revocable"),
+    got.join(" | "));
+  check("alerts are written to the alert log as well as stdout",
+    readFileSync(paths.alerts, "utf8").trim().split("\n").length === 2);
+
+  mark = since();
+  chain.assets.push(piAsset("BBB"));
+  await r.w.tick();
+  got = mark();
+  check("a second asset is NEW, not FIRST", got.length === 1 && got[0]!.includes("NEW ASSET BBB"), got.join(" | "));
+
+  mark = since();
+  chain.pools.push(piPool("p1", "native", piKey("AAA")));
+  await r.w.tick();
+  got = mark();
+  check("the first pool alerts FIRST and NEW with its pair and fee_bp, zero reserves and all",
+    got.length === 2 && got[0]!.includes("FIRST POOL EVER SEEN") &&
+      got[1]!.includes("NEW POOL p1 PI/AAA(GPII..ISSU) fee_bp=30"),
+    got.join(" | "));
+
+  mark = since();
+  chain.pools.push(piPool("p2", piKey("AAA"), "native", 25));
+  await r.w.tick();
+  got = mark();
+  check("a second pool on a pair raises SECOND POOL ON PAIR (section 2.1)",
+    got.some((l) => l.includes("SECOND POOL ON PAIR") && l.includes("p2 joins p1")) &&
+      got.some((l) => l.includes("fee_bp=25")),
+    got.join(" | "));
+
+  mark = since();
+  chain.pools.push(piPool("p3", piKey("AAA"), piKey("BBB")));
+  await r.w.tick();
+  got = mark();
+  check("a pool with two non-native assets raises TOKEN/TOKEN POOL (section 2.2)",
+    got.some((l) => l.includes("TOKEN/TOKEN POOL p3")) && !got.some((l) => l.includes("SECOND POOL")),
+    got.join(" | "));
+
+  mark = since();
+  chain.pools.splice(0, 1);
+  chain.assets.splice(1, 1);
+  await r.w.tick();
+  got = mark();
+  check("disappearances alert: ASSET GONE and POOL GONE",
+    got.some((l) => l.includes("ASSET GONE BBB")) && got.some((l) => l.includes("POOL GONE p1")),
+    got.join(" | "));
+
+  // Protocol: the first root answer is recorded, not alerted; a change alerts.
+  const rootsBefore = jsonl(paths.protocol).length;
+  mark = since();
+  chain.root = { ...chain.root, current_protocol_version: 28 };
+  for (let i = 0; i < 6; i++) await r.w.tick();
+  got = mark();
+  check("a protocol change alerts once and is written to the protocol file",
+    got.filter((l) => l.includes("PROTOCOL CHANGED current_protocol_version 27 -> 28")).length === 1 &&
+      rootsBefore === 1 && jsonl(paths.protocol).length === 2,
+    got.join(" | "));
+  check("the first root answer is printed with the network passphrase",
+    r.lines.some((l) => l.includes('network_passphrase="Pi Network"')));
+
+  // Blindness: per endpoint, at exactly PI_BLIND_AFTER, once; then recovery.
+  chain.failing.add("assets");
+  mark = since();
+  for (let i = 0; i < PI_BLIND_AFTER - 1; i++) await r.w.tick();
+  check("five failed polls are not yet BLIND", mark().length === 0, mark().join(" | "));
+  await r.w.tick();
+  await r.w.tick();
+  got = mark();
+  check("the sixth failed poll raises BLIND, once",
+    got.length === 1 && got[0]!.includes("BLIND assets: 6 consecutive failed polls"), got.join(" | "));
+  check("failed polls are in the coverage record with their error",
+    jsonl(paths.watch).filter((l) => l.endpoint === "assets" && l.error === "fake assets down").length === 7);
+  chain.failing.delete("assets");
+  mark = since();
+  await r.w.tick();
+  got = mark();
+  check("the first good poll after BLIND raises RECOVERED with the blind span",
+    got.length === 1 && got[0]!.includes("RECOVERED assets after 7 consecutive failed polls") &&
+      got[0]!.includes("blind from"),
+    got.join(" | "));
+  check("stdout reports classic assets, never bare assets",
+    r.lines.filter((l) => l.includes(" tick=")).every((l) => l.includes(" classic_assets=") && !/ assets=/.test(l)));
+
+  // Every record line joins to the poll that produced it.
+  const polls = new Set(jsonl(paths.watch).map((l) => l.poll));
+  const recs = [...jsonl(paths.assets), ...jsonl(paths.pools), ...jsonl(paths.protocol)];
+  check("every record line carries a poll id found in the coverage record",
+    recs.length > 0 && recs.every((l) => typeof l.poll === "string" && polls.has(l.poll)),
+    `${recs.length} lines`);
+  check("record lines keep the Horizon record verbatim",
+    JSON.stringify(jsonl(paths.pools).find((l) => l.key === "p3")?.record) ===
+      JSON.stringify(piPool("p3", piKey("AAA"), piKey("BBB"))));
+}
+
+// --- Truncated walks ----------------------------------------------------------
+
+{
+  const chain = piChain({ assets: [piAsset("A"), piAsset("B"), piAsset("C")], pageSize: 2 });
+  const paths = piPaths();
+  const full = piWatcher(paths, chain);
+  await full.w.tick();
+  chain.assets.unshift(piAsset("NEW"));        // first in the walk, so a capped walk reaches it
+  const capped = piWatcher(paths, chain, 1);
+  await capped.w.tick();
+  const got = capped.alerts();
+  check("a truncated walk alerts what it found and never reports GONE",
+    got.length === 1 && got[0]!.includes("NEW ASSET NEW") &&
+      jsonl(paths.assets).every((l) => l.event !== "gone"),
+    got.join(" | "));
+  const newLine = jsonl(paths.assets).find((l) => l.key === piKey("NEW"));
+  const source = jsonl(paths.watch).find((l) => l.poll === newLine?.poll);
+  check("replay can tell a record came from a truncated walk, by its poll id",
+    source?.truncated === true && source.endpoint === "assets", JSON.stringify(source));
+}
+
+// --- Churn guard (A6) ---------------------------------------------------------
+
+{
+  const codes = ["A", "B", "C", "D"];
+  const chain = piChain({ assets: codes.map((c) => piAsset(c, { last_modified_ledger: 1 })) });
+  const r = piWatcher(piPaths(), chain);
+  await r.w.tick();
+  const n0 = r.alerts().length;
+
+  // Two of four changing is not more than half.
+  chain.assets = codes.map((c, i) => piAsset(c, { last_modified_ledger: i < 2 ? 2 : 1 }));
+  await r.w.tick();
+  check("half the records changing is not churn", r.alerts().length === n0);
+
+  // All four change in the same field: one alert, naming it.
+  chain.assets = codes.map((c) => piAsset(c, { last_modified_ledger: 3 }));
+  await r.w.tick();
+  let churn = r.alerts().filter((l) => l.includes("SUSPECT CHURN"));
+  check("more than half changing raises SUSPECT CHURN naming the field",
+    churn.length === 1 && churn[0]!.includes("4 of 4 known records") &&
+      churn[0]!.includes("last_modified_ledger (4/4)") && churn[0]!.includes("IGNORED_FIELDS"),
+    churn.join(" | "));
+
+  chain.assets = codes.map((c) => piAsset(c, { last_modified_ledger: 4 }));
+  await r.w.tick();
+  churn = r.alerts().filter((l) => l.includes("SUSPECT CHURN"));
+  check("the same churn is alerted once, not every poll", churn.length === 1, String(churn.length));
+  check("churning records are still written, not suppressed",
+    jsonl(r.paths.assets).filter((l) => l.event === "changed").length === 2 + 4 + 4);
+  check("churn rule: strictly more than half of those known",
+    churnSuspect(4, 3) && !churnSuspect(4, 2) && churnSuspect(1, 1) && !churnSuspect(0, 0));
+}
+
+// --- Restarts -----------------------------------------------------------------
+
+{
+  const chain = piChain({ assets: [piAsset("A"), piAsset("B")], pools: [piPool("p1", "native", piKey("A"))] });
+  const paths = piPaths();
+  const first = piWatcher(paths, chain);
+  check("a watcher with no files says so, and says what it cannot see",
+    first.w.banner().some((l) => l.includes("files missing:") && l.includes(paths.assets)) &&
+      first.w.banner().some((l) => l.includes("reported as the FIRST ever")) &&
+      first.w.banner().some((l) => l.includes("CANNOT SEE  tokens issued as contracts")) &&
+      first.w.banner().some((l) => l.includes("NOT zero tokens")));
+  await first.w.tick();
+  check("the first run alerts both assets and the pool", first.alerts().length === 5,
+    first.alerts().join(" | "));
+
+  const assetLines = jsonl(paths.assets).length;
+  const second = piWatcher(paths, chain);
+  await second.w.tick();
+  check("a restart does not alert again on anything already recorded",
+    second.alerts().length === 0 && jsonl(paths.assets).length === assetLines,
+    second.alerts().join(" | "));
+  check("a restart reads the state back and says so",
+    second.w.banner().some((l) => l.includes("read back 2 classic assets, 1 pools, protocol 27")) &&
+      !second.w.banner().some((l) => l.includes("FIRST ever")),
+    second.w.banner().find((l) => l.includes("read back")));
+
+  // A power cut mid-write leaves a half line. It is skipped, counted, reported.
+  appendFileSync(paths.assets, '{"ts":"2026-09-23T00:00:0');
+  const third = piWatcher(paths, chain);
+  await third.w.tick();
+  check("a half-written line is skipped, counted and shown at startup",
+    third.w.loaded.skippedLines[paths.assets] === 1 &&
+      third.w.banner().some((l) => l.includes(`skipped 1 unreadable line(s) in ${paths.assets}`)));
+  check("a half-written line causes no re-alert", third.alerts().length === 0, third.alerts().join(" | "));
+
+  // Gone, then a restart, then back: the tombstone survived the restart.
+  chain.assets.splice(1, 1);
+  const fourth = piWatcher(paths, chain);
+  await fourth.w.tick();
+  check("a disappearance is alerted once", fourth.alerts().length === 1 &&
+    fourth.alerts()[0]!.includes("ASSET GONE B"), fourth.alerts().join(" | "));
+  check("the next write after a half line starts on a line of its own",
+    readFileSync(paths.assets, "utf8").split("\n").includes('{"ts":"2026-09-23T00:00:0') &&
+      loadState(paths).skippedLines[paths.assets] === 1);
+  chain.assets.push(piAsset("B"));
+  const fifth = piWatcher(paths, chain);
+  check("after a restart the gone asset is not in the known set",
+    fifth.w.banner().some((l) => l.includes("read back 1 classic assets")));
+  await fifth.w.tick();
+  check("a return after a restart is NEW, not FIRST",
+    fifth.alerts().length === 1 && fifth.alerts()[0]!.includes("NEW ASSET B"), fifth.alerts().join(" | "));
+
+  const empty = loadState(piPaths());
+  check("missing files load as empty state",
+    empty.assets.current.size === 0 && !empty.assets.everSeen && empty.missing.length === 3);
+}
+
+// --- The Stellar venue's requests did not move -------------------------------
+//
+// Captured from the UNMODIFIED stellar.ts, before walkShard took a base URL:
+// fetchPools() against a transport that answers every page empty. Each entry
+// is [url, method, headers, has a body].
+const PINNED_STELLAR_REQUESTS = [
+  "", "1555", "2aaa", "4000", "5555", "6aaa", "8000", "9555", "aaaa", "c000", "d555", "eaaa",
+].map((cut) => JSON.stringify([
+  "https://horizon.stellar.org/liquidity_pools?limit=200&order=asc" +
+    (cut ? `&cursor=${cut.padEnd(64, "0")}` : ""),
+  "GET",
+  { Accept: "application/json" },
+  false,
+])).sort();
+
+{
+  const realFetch = globalThis.fetch;
+  const seen: string[] = [];
+  try {
+    globalThis.fetch = (async (url: any, init: any) => {
+      seen.push(JSON.stringify([String(url), init?.method, init?.headers, init !== undefined && "body" in init]));
+      return new Response(JSON.stringify({ _embedded: { records: [] }, _links: { next: { href: `${url}&x` } } }));
+    }) as typeof fetch;
+    await new StellarVenue().fetchPools();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  check("the Stellar venue's requests are byte-identical to those pinned before the change",
+    JSON.stringify(seen.sort()) === JSON.stringify(PINNED_STELLAR_REQUESTS),
+    `${seen.length} requests`);
+  check("toPool is exported for Phase 2 and still rejects a zero-reserve pool",
+    stellarToPool(piPool("z", "native", piKey("A"))) === null &&
+      stellarToPool({ ...piPool("z", "native", piKey("A")),
+        reserves: [{ asset: "native", amount: "1" }, { asset: piKey("A"), amount: "2" }] })?.feeBp === 30);
+}
+
+// --- pi-watch.ts cannot write to a chain -------------------------------------
+
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const piRaw = readFileSync(resolve(here, "..", "src", "pi-watch.ts"), "utf8");
+  const stellarRaw = readFileSync(resolve(here, "..", "src", "venues", "stellar.ts"), "utf8");
+
+  const specs = (src: string) => {
+    const code = codeOnly(src, true);
+    return [
+      ...[...code.matchAll(/\bfrom\s*["']([^"']+)["']/g)].map((m) => m[1]!),
+      ...[...code.matchAll(/\bimport\s*["']([^"']+)["']/g)].map((m) => m[1]!),
+      ...[...code.matchAll(/\b(?:import|require)\s*\(\s*["']([^"']+)["']/g)].map((m) => m[1]!),
+    ];
+  };
+  const PI_ALLOWED_IMPORTS = ["node:fs", "node:path", "node:url", "./config.js", "./venues/stellar.js"];
+  const piSpecs = specs(piRaw);
+  check("pi-watch.ts imports exactly node:fs, node:path, node:url, config and the Stellar venue",
+    piSpecs.length > 0 && piSpecs.every((s) => PI_ALLOWED_IMPORTS.includes(s)), piSpecs.join(", "));
+  check("the Stellar venue it imports still imports no package",
+    nonLocalImports(stellarRaw).length === 0, nonLocalImports(stellarRaw).join(", "));
+
+  /** Substrings banned from pi-watch.ts, comments included. */
+  const PI_BANNED = ["stellar-sdk", "keypair", "transactionbuilder", "submit", "secret", "privatekey",
+    "mnemonic", "wallet", "process.env", '"post"', "'post'", "sign"];
+  const piBannedHits = (text: string) => {
+    const scrubbed = text.replace(/\bAbortSignal\b/g, "").replace(/\bsignal\b/g, "").toLowerCase();
+    return PI_BANNED.filter((s) => scrubbed.includes(s));
+  };
+  check("pi-watch.ts contains no key, submit or write vocabulary, even in comments",
+    piBannedHits(piRaw).length === 0, piBannedHits(piRaw).join(", "));
+  const piProbe = piBannedHits(
+    'import { Keypair } from "@stellar/stellar-sdk"; x.submitTransaction(); method: "POST"; process.env.S; signer',
+  );
+  check("the pi scan catches each banned shape", piProbe.length === 6, piProbe.join(", "));
+  check("pi-watch.ts makes no request of its own: no fetch call outside getJson",
+    !/\bfetch\s*\(/.test(codeOnly(piRaw)));
+  check("getJson still pins GET and sends no body",
+    /method:\s*"GET"/.test(codeOnly(stellarRaw, true)) && !/\bbody\s*:/.test(codeOnly(stellarRaw)));
+  check("no Stellar SDK in package.json", !allDeps.includes("@stellar/stellar-sdk"), allDeps.join(","));
+  check("npm run pi-watch runs src/pi-watch.ts",
+    (pkg as any).scripts?.["pi-watch"] === "tsx src/pi-watch.ts");
+  check("importing pi-watch.ts did not start it", !isEntry(
+    pathToFileURL(resolve(here, "..", "src", "pi-watch.ts")).href, process.argv[1]));
+}
+
+// --- These tests never touch the live files ----------------------------------
+
+{
+  // The needle is assembled, as for the CSV guard, so this file does not match itself.
+  const LIVE = "data" + "/pi-";
+  const selfSrc = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  check("the pi tests write only under tmpdir, never the live data/ files",
+    !selfSrc.includes(LIVE) &&
+      Object.values(PI_PATHS).every((p) => p.startsWith(LIVE)) &&
+      jsonl(join(PI_TMP, "0", "watch.jsonl")).length > 0);
+  rmSync(PI_TMP, { recursive: true, force: true });
+}
 
 console.log(fail === 0 ? "\nall checks passed" : `\n${fail} FAILED`);
 process.exit(fail === 0 ? 0 : 1);

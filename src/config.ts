@@ -1041,3 +1041,37 @@ export const BASE_SEED_TOKENS: readonly BaseSeedToken[] = [
     note: "UNVERIFIED: owner to check on basescan",
   },
 ];
+
+// ---------------------------------------------------------------------------
+// Pi mainnet watcher (src/pi-watch.ts, Phase 0 of docs/pi-mainnet.md)
+//
+// Read by pi-watch only. The watcher runs in its own process and never joins
+// the monitor loop, so nothing above is affected by these values.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pi mainnet Horizon. Read-only REST; only GET requests are ever issued, and
+ * the watcher refuses to follow a paging link to any other origin.
+ */
+export const PI_HORIZON_URL = "https://api.mainnet.minepi.com";
+
+/**
+ * One watcher tick, in milliseconds. /assets is walked every tick, and so is
+ * /liquidity_pools once any asset exists. 144 ticks a day.
+ */
+export const PI_WATCH_MS = 10 * 60_000;
+
+/**
+ * Every how many ticks the slow polls run: the Horizon root always, and
+ * /liquidity_pools while /assets is empty. 6 x 10 min = hourly, which is what
+ * section 3.2 specifies and what the 192-requests-a-day budget in 3.3 assumes.
+ */
+export const PI_SLOW_EVERY = 6;
+
+/**
+ * Consecutive failed polls of one endpoint after which the watcher raises a
+ * BLIND alert. Counted per endpoint, so a failing /assets is not masked by an
+ * hourly root poll that happens to succeed. At 10-minute polls, 6 is an hour
+ * without sight of /assets.
+ */
+export const PI_BLIND_AFTER = 6;

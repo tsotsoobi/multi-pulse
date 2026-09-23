@@ -7,6 +7,7 @@
     "monitor": "tsx src/monitor.ts",
     "seeds": "tsx scripts/seeds.ts",
     "verify-seeds": "tsx scripts/verify-seeds.ts",
+    "pi-watch": "tsx src/pi-watch.ts",
     "check": "tsx test/check.ts",
     "typecheck": "tsc --noEmit"
   },

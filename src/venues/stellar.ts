@@ -31,7 +31,7 @@ interface HorizonReserve {
   amount?: unknown;
 }
 
-interface HorizonPoolRecord {
+export interface HorizonPoolRecord {
   id?: unknown;
   fee_bp?: unknown;
   type?: unknown;
@@ -225,8 +225,15 @@ interface ShardResult {
  * a missing `next` link and never a short page -- with one addition: a shard
  * also stops when it walks past its own ceiling, because the records beyond it
  * belong to the next shard and are being fetched there concurrently.
+ *
+ * `baseUrl` defaults to HORIZON_URL, so every existing call issues exactly the
+ * request it always did. It exists so that another Horizon, Pi's in Phase 2 of
+ * docs/pi-mainnet.md, can be walked by the same code rather than a copy.
  */
-async function walkShard(bound: ShardBound): Promise<ShardResult> {
+async function walkShard(
+  bound: ShardBound,
+  baseUrl: string = HORIZON_URL,
+): Promise<ShardResult> {
   const out: ShardResult = {
     pools: [],
     pages: 0,
@@ -236,7 +243,7 @@ async function walkShard(bound: ShardBound): Promise<ShardResult> {
   };
 
   let url =
-    `${HORIZON_URL}/liquidity_pools` +
+    `${baseUrl}/liquidity_pools` +
     `?limit=${HORIZON_PAGE_LIMIT}&order=asc` +
     (bound.after ? `&cursor=${bound.after}` : "");
 
@@ -288,7 +295,7 @@ async function walkShard(bound: ShardBound): Promise<ShardResult> {
  * writing. There is no request body, no Authorization header, and no other
  * transport in this repo.
  */
-async function getJson(url: string): Promise<any> {
+export async function getJson(url: string): Promise<any> {
   for (let attempt = 1; ; attempt++) {
     let res: Response;
     try {
@@ -351,7 +358,7 @@ function sleep(ms: number): Promise<void> {
  * every route through the pool by the size of the guess. Skipped records are
  * counted so a sudden jump is visible in the heartbeat.
  */
-function toPool(r: HorizonPoolRecord): Pool | null {
+export function toPool(r: HorizonPoolRecord): Pool | null {
   if (typeof r.id !== "string" || r.id.length === 0) return null;
 
   // Only constant-product pools; simulate() prices nothing else.
