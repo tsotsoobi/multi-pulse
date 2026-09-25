@@ -73,6 +73,10 @@ priced close enough to the pools that strict-send paths route through them.
 **Trigger:** none. This phase starts now, because the only thing to observe is the moment
 something appears.
 
+*Correction, 25 September 2026: the premise of the sentence above is wrong. A poll after a
+gap still lists what was created during it, so a gap delays notice and does not lose the
+observation. The sentence is left as written; see 3.7.*
+
 ### 3.1 Design
 
 A separate script inside multi-pulse, `src/pi-watch.ts`, run as its own npm script
@@ -196,6 +200,189 @@ reaches nobody who is away from it, and so is no better than stdout.
 FINDINGS section 7 traced nine unobserved hours to power loss. The watcher's value is in not
 missing the first appearance, so it has the same dependency on mains power and network
 continuity, and the same fix applies before its output is treated as evidence.
+
+*Correction, 25 September 2026: the paragraph above is left as written, but its premise is
+wrong. For the question Phase 0 answers, a gap costs latency of notice, not the observation,
+and the power fix is not a precondition for treating its output as evidence. See 3.7.*
+
+### 3.6 First results, 23 to 25 September 2026
+
+Measured on 25 September 2026, read-only, from `data/pi-watch.jsonl` and
+`data/pi-alerts.log`, up to and including the line at 2026-09-25T15:46:59.772Z. The watcher
+kept running after that; later lines are not counted. Causes come from the Windows System
+event log (Kernel-Power and Power-Troubleshooter events), from pi-pulse's
+`data/keep-awake.log`, which records AC or battery every 5 minutes, and from multi-pulse's
+own `data/opportunities.csv` for the same windows.
+
+**State at the last poll.** The watcher started at 2026-09-23T15:14:56Z and ran as one
+process with no restart: every poll id carries the same run id. At the last poll,
+2026-09-25T15:46:59Z, `/assets` returned 0 classic assets and `/liquidity_pools` returned 0
+pools. Every successful poll of either endpoint in the run returned zero. The root reported
+protocol 27 on its first poll and never changed.
+
+**Record files.**
+
+| File | Lines |
+|---|---|
+| `data/pi-watch.jsonl` | 163 |
+| `data/pi-alerts.log` | 8 |
+| `data/pi-protocol.jsonl` | 1 |
+| `data/pi-assets.jsonl` | does not exist |
+| `data/pi-pools.jsonl` | does not exist |
+
+The asset and pool files are created by the first record written to them, so their absence
+is itself the record that nothing was ever seen.
+
+**Polls per endpoint.**
+
+| Endpoint | Attempted | Answered | Failed |
+|---|---|---|---|
+| `/assets` | 121 | 65 | 56 |
+| `/liquidity_pools` | 21 | 10 | 11 |
+| `/` | 21 | 10 | 11 |
+| **Total** | **163** | **85** | **78** |
+
+**Coverage, three states kept apart.** The span is 2026-09-23T15:14:56Z to
+2026-09-25T15:46:59Z, 2,912 minutes (48.5 hours). Each `/assets` attempt is credited with
+the time to the next attempt, capped at the 10-minute interval, under the outcome of that
+attempt. Span credited to no attempt is time with no poll.
+
+| State | Minutes | Hours | Share of span |
+|---|---|---|---|
+| Polled and answered | 639 | 10.65 | 22.0% |
+| Polled and failed | 539 | 8.99 | 18.5% |
+| Not polled at all | 1,734 | 28.90 | 59.5% |
+
+About 22% of the span was observed.
+
+**No-poll gaps over 25 minutes**, between consecutive `/assets` lines. Each length includes
+the normal 10-minute interval.
+
+| From | To | Minutes |
+|---|---|---|
+| 23 Sep 17:45:01 | 23 Sep 19:43:27 | 118.4 |
+| 23 Sep 20:03:25 | 24 Sep 04:22:01 | 498.6 |
+| 24 Sep 04:22:01 | 24 Sep 06:58:47 | 156.8 |
+| 24 Sep 17:28:54 | 25 Sep 10:06:53 | 998.0 |
+
+Four gaps, the largest 998 minutes, 1,772 minutes in total. The second and third are one
+night, split by a single failed poll at 04:22 (below).
+
+**Blindness episodes**, from `data/pi-alerts.log`. BLIND fired on the sixth consecutive
+failed poll of an endpoint and RECOVERED on the next success, both as designed.
+
+| Episode | Endpoint | Blind from | Recovered | Span | Failed polls | BLIND fired |
+|---|---|---|---|---|---|---|
+| 1 | `/assets` | 23 Sep 19:43:27 | 24 Sep 07:08:48 | 11 h 25 min | 6 | 24 Sep 06:59:08 |
+| 2 | `/assets` | 24 Sep 08:29:07 | 24 Sep 14:48:55 | 6 h 20 min | 38 | 24 Sep 09:19:07 |
+| 2 | `/liquidity_pools` | 24 Sep 08:29:27 | 24 Sep 15:28:55 | 6 h 59 min | 7 | 24 Sep 13:29:27 |
+| 2 | `/` | 24 Sep 08:29:47 | 24 Sep 15:28:55 | 6 h 59 min | 7 | 24 Sep 13:29:47 |
+
+- **Episode 1 is mostly not-polled time, not failed-poll time.** Six failed polls spread
+  over 11 h 25 min, with the machine in standby or hibernation from 20:07 to 06:58. The
+  alert counts consecutive failures, so its span mixes two of the three states above, and
+  it fired only once the machine woke.
+- **On the hourly endpoints BLIND fires five hours after the first failure,** and RECOVERED
+  waits for the next hourly slot: `/assets` answered again from 14:48, pools and root were
+  next tried at 15:28.
+- A streak of five `/assets` failures on 25 September, 10:47 to 11:27, stayed below six and
+  raised no alert, as designed.
+
+**Causes of the failed polls.** All 78 carry the error "fetch failed". That text says only
+that the request did not complete, not why. FINDINGS 7.2 lists it among connectivity
+failures; FINDINGS 7.1 left grid outage versus unplugged charger undetermined. Here the
+same text covers more than one cause:
+
+| Failed polls | When | Machine | Cause |
+|---|---|---|---|
+| 52 | 24 Sep 08:29 to 14:39 | Awake, on AC throughout | No network at this machine. The main monitor failed on every tick of all three venues in the same window, 370 each, XRPL with `getaddrinfo ENOTFOUND`. Whether the router or the ISP was down is not determined. |
+| 9 | 23 Sep 16:15 to 17:15 | Awake, on AC | The network at this machine, intermittently: the main monitor's venues failed on most ticks in the same hour. Cause upstream not determined. |
+| 5 | 23 Sep 19:43 to 20:04 | Lid open, on battery since a power source change at 17:46 | The network at this machine: all monitor ticks failed too. Mains was off, which fits a grid outage taking the router down; not confirmed. |
+| 7 | 25 Sep 10:47 to 11:27 | On battery; Modern Standby entered at 10:44:07, reason "Idle Timeout", exited 11:26:02 | Standby, although keep-awake logged `request=held` throughout. |
+| 5 | 24 Sep 04:22, 06:58, 06:59; 25 Sep 10:06, 10:07 | Around sleep | Three polls began just before the machine slept and failed on waking, 2.6 to 11.5 hours later. Two began within 20 s of waking, before the network was back. |
+
+In every window where the watcher failed, the main monitor's venues failed as well, so none
+of the 78 failures is Pi's Horizon.
+
+**Causes of the no-poll gaps: the lid was closed.** All four gaps fall inside three lid
+closures, each starting at a Modern Standby entry with reason "Lid" and ending at an exit
+with reason "Lid":
+
+- 23 Sep 17:46:42 to 19:43:01, the 118-minute gap: the evening of 23 September.
+- 23 Sep 20:07:20 to 24 Sep 06:58:32, overnight. The machine hibernated at 04:22:03
+  ("Standby Battery Budget Exceeded"); the lone poll at 04:22:01 ran in the seconds it was
+  up before hibernating.
+- 24 Sep 17:32:02 to 25 Sep 10:06:45, overnight, hibernating from 22:36:25 for the same
+  reason.
+
+That is two overnight closures, as expected, and a third, shorter one in the evening of 23
+September.
+
+keep-awake (pi-pulse `scripts/keep-awake.ps1`, running since 2026-09-23T10:13:02Z) cannot
+cover these. It prevents idle-timeout standby only, and its own start-up line says it
+"CANNOT PREVENT: a user-initiated sleep, a lid-close action, a critical-battery shutdown, or
+Windows overriding this under battery austerity". The 25 September standby at 10:44 is the
+last of those: on battery, entered on idle timeout, while the request was held. The
+script's header says the lid action was set to "Do nothing"; the "Lid" entries above show
+that closing the lid did put this machine into standby.
+
+### 3.7 Correction, 25 September 2026: a gap delays notice, it does not lose the observation
+
+**What was written.** The trigger of section 3 ("the only thing to observe is the moment
+something appears") and the last paragraph of 3.5 ("The watcher's value is in not missing
+the first appearance") treat Phase 0's value as catching the first asset as it appears.
+Both are left as written above, each with a note pointing here, in the way FINDINGS 8.5
+records a gap without changing 8.3.
+
+**Why that premise is wrong** (inferred from Stellar's documented rules; to be tested on the
+first real record). `/assets` and `/liquidity_pools` list what exists now. An asset stays
+listed while it has trustlines, a pool while it has trustlines to it. A poll after a gap
+therefore lists everything created during the gap that still exists, and Horizon's history
+routes can say when it was created. What thin coverage costs is latency of notice, not the
+observation itself.
+
+**Where the records carry the creation ledger, and where they do not.** The brief for this
+correction said the records carry the ledger they were created in. By Horizon's documented
+record shapes that holds only partly, and neither shape has been seen on Pi yet:
+
+- A pool record carries `last_modified_ledger` and `last_modified_time`. That is the ledger
+  of the pool's latest change, equal to its creation ledger only until its first deposit,
+  trade or trustline change. The creation ledger itself is in the pool's history, its
+  earliest operation or effect (`GET /liquidity_pools/{id}/operations?order=asc&limit=1`).
+- An asset record carries no ledger or time field at all, and Horizon has no per-asset
+  history route. The issuer account's history (`GET /accounts/{issuer}/operations?order=asc`)
+  bounds it: when the issuer was created, and when it first paid the asset out.
+
+Both depend on Pi's Horizon still serving that history when asked. Its retention has not
+been measured.
+
+**Consequences.**
+
+1. **"Pi mainnet had zero assets and zero pools" holds for the whole span, as at the last
+   successful poll (2026-09-25T15:46:59Z), not only for the 22% observed.** Anything created
+   in between and still existing would have been listed. Two limits remain: it is zero
+   classic assets (section 4.2), and something created and removed again inside a gap, an
+   asset or pool whose last trustline was removed, would not be listed. On a chain that had
+   none of either, that is unlikely, but these polls do not exclude it.
+2. **Whether a gap matters depends on the question.** For a rate over time, as in FINDINGS
+   section 8, a missed hour is a missed sample, which is why 8.3 counts observed hours
+   rather than calendar hours. For "has this ever happened", one successful poll is as good
+   as a hundred, provided the thing still exists. Phase 0's alerts are the second kind.
+   Phase 2's depth, volume and per-tick measurements are the first kind, and coverage
+   matters again there.
+3. **Proposed as the next small change, not implemented: report the creation ledger.** When
+   the watcher first sees a pool or asset, it would make one further read and put the
+   creation ledger and its close time in the alert and in the record line, so that a late
+   detection becomes an exactly dated one. Phase 0 does not capture this today. It keeps
+   every record verbatim (`walkAll`, written as `record` in `data/pi-assets.jsonl` and
+   `data/pi-pools.jsonl`), so a pool's `last_modified_ledger` would be kept, but that is the
+   creation ledger only if nothing touched the pool before the poll, and an asset record has
+   no such field. The change is one GET per new pool, or the issuer-history bound per new
+   asset, to the same host through `getJson`, so the watcher stays read-only.
+4. **Where Phase 0 runs is a smaller question than it looked.** The last paragraph of 3.5
+   asked for the FINDINGS 7 power fix before Phase 0's output counts as evidence. For
+   Phase 0's question it does not need it. A daily scan answers the same question as a
+   held-open process, with worse notice. Recorded as undecided in section 7.
 
 ## 4. Phase 1: when assets appear
 
@@ -352,6 +539,13 @@ Every one of these must hold before the decision is opened, not merely most of t
   Phase 2 data is examined.
 - The capital cap in 6.4.
 - Whether Phase 3 is ever opened.
+- Where Phase 0 runs (added 25 September 2026): a held-open process on this laptop, as
+  since 23 September, or a daily scan from any machine. For the question Phase 0 answers,
+  whether anything exists yet, a daily scan answers it as well as a held-open process
+  (3.7). What it gives up is notice, up to a day, and, until the creation-ledger change in
+  3.7 is made, the exact dating of what it finds. Dating a late find also relies on Pi's
+  Horizon history retention, which is not measured. The question returns in Phase 2, where
+  rates are measured and coverage counts.
 
 ### Decided
 
