@@ -1,7 +1,8 @@
 # Pi mainnet
 
 A phased plan for Pi mainnet, from read-only watching now to a funded liquidity decision
-later. Written 23 September 2026. Nothing here has been built or executed.
+later. Written 23 September 2026. Phase 0, the read-only watcher, was built and started on
+23 September 2026; nothing in Phases 1 to 3 has been built or executed.
 
 Every statement is marked as one of four kinds, and they are kept apart on purpose:
 
@@ -68,7 +69,7 @@ graph that has no cycles.
 this project creating it; a second pool on an existing pair; or order books on mainnet
 priced close enough to the pools that strict-send paths route through them.
 
-## 3. Phase 0: read-only watcher (build now)
+## 3. Phase 0: read-only watcher (built 23 September 2026)
 
 **Trigger:** none. This phase starts now, because the only thing to observe is the moment
 something appears.
@@ -76,6 +77,9 @@ something appears.
 *Correction, 25 September 2026: the premise of the sentence above is wrong. A poll after a
 gap still lists what was created during it, so a gap delays notice and does not lose the
 observation. The sentence is left as written; see 3.7.*
+
+*Correction, 26 September 2026: "starts now" was true when written. Phase 0 started at
+2026-09-23T15:14:56Z and has been running since (3.6).*
 
 ### 3.1 Design
 
@@ -101,6 +105,40 @@ serves the same routes, so the only change to `src/venues/stellar.ts` is to stop
 **Read-only by construction, as the rest of the repo is.** No key, no signer, no
 `@stellar/stellar-sdk`, no submit endpoint. No new library: the watcher uses `fetch` and
 `node:fs`, both already in use.
+
+*Correction, 26 September 2026: the design above is left as written, but what was built
+differs from it. Checked against the working tree, reading `src/pi-watch.ts`,
+`src/venues/stellar.ts`, `src/config.ts` and `package.json`. The departure in the first
+point is recorded in the code's own header comment in `src/pi-watch.ts`, which states the
+`walkShard` and `toPool` reason itself, and it was built in commit 7a917da, the commit that
+built Phase 0. It was proposed and approved in the build session before that commit; the
+approval itself is not in the repository. So it is this section that drifted, not the
+code.*
+
+- *The watcher reuses `getJson` only, not the walk. It walks with its own `walkAll` in
+  `src/pi-watch.ts`. The reason, from that file's header comment: `walkShard` passes every
+  record through `toPool` and discards the raw one, and `toPool` rejects a pool whose
+  reserves are zero. A new pool has zero reserves from its creation until its first
+  deposit, so walking Pi with `walkShard` would have hidden the first-pool event that
+  triggers Phase 2.*
+- *The `baseUrl` parameter on `walkShard` and the export of `toPool` exist for Phase 2, not
+  Phase 0. Nothing calls either with a Pi URL today; `walkShard`'s only caller passes no
+  URL, so it uses the default.*
+- *"The only change to `src/venues/stellar.ts` is to stop hardcoding `HORIZON_URL`" is
+  inexact. The change is a `baseUrl` parameter on `walkShard`, and `HORIZON_URL` is still
+  imported and used as its default.*
+- *`walkAll` keeps `walkShard`'s termination rule, the zero-record page, and is stricter in
+  three ways: a page with no `_embedded.records` throws rather than counting as empty; a
+  non-empty page with no `next` link throws rather than ending the walk; and a `next` link
+  to any origin other than the first URL's is refused.*
+- *`src/config.ts` also gained two constants not listed above: `PI_SLOW_EVERY = 6`, the
+  number of ticks between the slow polls (the Horizon root always, and `/liquidity_pools`
+  while `/assets` is empty), which makes them hourly; and `PI_BLIND_AFTER = 6`, the number
+  of consecutive failed polls of one endpoint after which the watcher raises a BLIND alert.*
+- *The watcher also imports `node:path` and `node:url`. Both are built in and already used
+  elsewhere in the repo, so "no new library" still holds.*
+- *Whether exporting `getJson` and `toPool` was part of this change or was already there
+  could not be told from the working tree.*
 
 ### 3.2 What it polls, assets before pools
 
@@ -559,9 +597,10 @@ Every one of these must hold before the decision is opened, not merely most of t
 
 | Phase | Starts when | Produces |
 |---|---|---|
-| 0 | Now | `data/pi-watch.jsonl` and alerts |
+| 0 | Started 23 September 2026 | `data/pi-watch.jsonl` and alerts |
 | 1 | First asset seen on `/assets` | Issuer control and supply per asset |
 | 2 | First pool seen on `/liquidity_pools` | Depth, fees, topology, a test of section 2 |
 | 3 | Phase 2 data meets every precondition in 6.3 | A decision, recorded, either way |
 
-No row has a date.
+No row has a planned date. Phase 0's row carries the date it started, recorded after the
+fact; Phases 1 to 3 start on their triggers, not on a date.
